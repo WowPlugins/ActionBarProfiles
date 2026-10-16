@@ -1,10 +1,26 @@
--- ActionBarProfiles.lua (WoW 1.12)
--- 纯手动版：只做"保存当前动作条 / 加载配置"，不监听动作条、不自动保存、不写任何东西到存档。
+-- ActionBarProfiles.lua（WoW 1.12 乌龟服 / WoW 3.3.5 WotLK 双版本）
+-- 纯手动版：只做"保存当前动作条 / 加载配置"，不监听动作条改动、不自动保存、不写动作条数据到存档。
 -- 作者：Sunelgy在原作者基础上优化，武藤纯子酱修复宏逻辑
+
+-- ===== 客户端版本探测 =====
+-- 同一份代码同时跑 1.12（乌龟服）和 3.3.5（WotLK）：GetActionInfo 是 2.0+ 才有的函数，
+-- 拿它当"新客户端"的特征最可靠；取不到时再用 GetBuildInfo 的版本号兜底（1.12.1 vs 3.3.5）。
+local function ABP_DetectModern()
+    if type(GetActionInfo) == "function" then return true end
+    local ver = GetBuildInfo and GetBuildInfo()
+    local major = ver and tonumber(string.match(ver, "^(%d+)")) or 0
+    return major >= 2
+end
 
 -- 全局状态与常量定义
 local ABP_PlayerName = nil -- 当前角色标识：角色名 of 服务器名
-local MAX_ACTIONS = 144 -- 最大动作槽数量
+local MAX_ACTIONS = 144 -- 1.12（乌龟服）的最大动作槽位
+-- 3.3.5 的玩家动作槽只有 1-120（本机 3.3.5 的 Bartender4 按 10 条 bar x 12 生成槽号，可验证）；
+-- 121 以上属于宠物/载具等特殊条，必须排除：否则宠物技能会被当成玩家技能写进档案，
+-- 而且给 PlaceAction 传非法槽号有崩客户端风险（官方文档明确警告过）。
+local WOTLK_MAX_ACTIONS = 120
+local ABP_IS_MODERN = ABP_DetectModern() -- 是否 2.0+ 客户端（3.3.5 为 true，1.12 为 false）
+local ABP_MAX_SLOTS = ABP_IS_MODERN and WOTLK_MAX_ACTIONS or MAX_ACTIONS
 local ABP_DebugLevel = 0 -- 诊断输出级别：0=关，1=打印扫描/比对结果
 -- 每个槽位"上次扫描"的分类结果：给加载时的"这个技能/物品其实已经在位"判断用
 local ABP_SlotKind = {}
@@ -80,6 +96,34 @@ local function ABP_CursorBusy()
     return false
 end
 
+-- 战斗状态：3.3.5 起动作条的拾取/放置类 API 是 #nocombat 限制函数（PickupAction 自 2.2 起受限），
+-- 战斗中调用会被客户端直接拒绝；1.12 没有 InCombatLockdown，这里恒为 false，旧行为完全不变。
+local function ABP_InCombat()
+    if InCombatLockdown then return InCombatLockdown() end
+    return false
+end
+
+-- 战斗中被推迟的加载：记下配置名，脱战后自动补做（仅新客户端会注册 PLAYER_REGEN_ENABLED）
+local ABP_PendingLoad = nil
+local function ABP_QueueLoad(profileName)
+    ABP_PendingLoad = profileName
+    ABP_Msg("|cffffcc00[ABP]|r 战斗中不能改动作条，已记下配置 \"" .. profileName .. "\"，脱战后自动加载.")
+end
+
+-- 取弹窗里的输入框：1.12 回调传进来的是"确定按钮"（父级才是弹窗），3.3.5 传进来的是弹窗本身；
+-- 输入框名字固定是 "<弹窗名>EditBox"。两种情况都兜住，取不到就返回 nil（不报错）。
+local function ABP_GetPopupEditBox(self)
+    local frame = self or this
+    if not frame then return nil end
+    local popup = frame
+    if popup.GetObjectType and popup:GetObjectType() == "Button" then
+        popup = popup:GetParent()
+    end
+    local name = popup and popup.GetName and popup:GetName()
+    if not name then return nil end
+    return getglobal(name .. "EditBox")
+end
+
 -- 将工具 Tooltip 绑定到 UIParent（供保存/加载时探测动作与物品名称）
 local function ABP_TooltipAttach()
     if ABP_Tooltip and ABP_Tooltip.SetOwner then
@@ -109,7 +153,9 @@ local function ABP_ForgetSlot(i)
     ABP_SlotRank[i] = nil
 end
 
--- 完整扫描单个槽位：宏 -> 技能 -> 物品（技能/物品靠 PickupAction + CursorHasSpell 判定）
+-- 完整扫描单个槽位：宏 -> 技能 -> 物品
+-- 3.3.5+：GetActionInfo 直接给出类型，不需要动光标（也就不会踩到战斗中的 #nocombat 限制）
+-- 1.12：没有 GetActionInfo，沿用"拾起 -> CursorHasSpell 判断 -> 放回"的探测法
 -- 顺带记下该槽位的分类，供加载时判断"这个技能/物品其实已经在位"
 local function ABP_ScanSlot(dest, i)
     if not HasAction(i) then
@@ -130,11 +176,17 @@ local function ABP_ScanSlot(dest, i)
     end
 
     local isSpell = false
-    PickupAction(i)
-    isSpell = CursorHasSpell()
-    PlaceAction(i)
+    if ABP_IS_MODERN then
+        -- 新客户端：直接问客户端这个槽位是什么，不动光标
+        isSpell = (GetActionInfo(i) == "spell")
+    else
+        -- 1.12：没有类型查询接口，只能靠"拾起来看光标上是技能还是物品"来判定
+        PickupAction(i)
+        isSpell = CursorHasSpell()
+        PlaceAction(i)
+    end
 
-    -- Tooltip 放在拾取/放回之后才读：PlaceAction 有可能顺手动到 Tooltip，先设后读才稳
+    -- 名字/等级一律从 Tooltip 读（两个客户端表现一致）；1.12 下要在拾取/放回之后再读才稳
     ABP_Tooltip:ClearLines()
     ABP_Tooltip:SetAction(i)
 
@@ -173,7 +225,7 @@ end
 local function ABP_CarryOverUnreadable(previous, dest)
     if not previous then return 0 end
     local carried = 0
-    for i = 1, MAX_ACTIONS do
+    for i = 1, ABP_MAX_SLOTS do
         if HasAction(i)
            and not dest.spells[i] and not dest.macros[i] and not dest.items[i] then
             local sp = previous.spells and previous.spells[i]
@@ -300,12 +352,12 @@ function ABP_RunSaveJob()
     -- 每帧处理多少个槽位：自检任务用更小的步长
     local per = job.slotsPerFrame or ABP_JobSlotsPerFrame
     local last = job.i + per
-    if last > MAX_ACTIONS then last = MAX_ACTIONS end
+    if last > ABP_MAX_SLOTS then last = ABP_MAX_SLOTS end
 
     -- 第一段：分帧完整扫描（宏/技能/物品）
     if job.phase == "scan" then
-        -- 玩家正在拖拽：本帧不动光标，等下一帧再继续
-        if ABP_CursorBusy() then
+        -- 1.12 的探测法要动光标，玩家正在拖拽时先让路；3.3.5 用 GetActionInfo 不碰光标，无需暂停
+        if not ABP_IS_MODERN and ABP_CursorBusy() then
             ABP_Dbg("光标上有物品/技能，暂停扫描")
             return
         end
@@ -315,7 +367,7 @@ function ABP_RunSaveJob()
         end
         job.i = last
 
-        if job.i >= MAX_ACTIONS then
+        if job.i >= ABP_MAX_SLOTS then
             SetCVar("autoSelfCast", job.scStatus) -- 扫描结束，还原 CVar
             job.phase = "done"
         end
@@ -371,10 +423,14 @@ function ABP_StartVerifyJob(profileName)
     return true
 end
 
--- 扫描法术书，构建"技能键(名+等级) -> 法术ID"映射（只找需要的技能，找到全部即停）
+-- 扫描法术书，构建映射（只找需要的技能，找齐即停）。返回：
+--   map.exact  = ["技能名 等级"] -> 法术书槽位
+--   map.byName = [技能名]        -> 同名的第一个槽位（兜底用）
+-- 为什么需要 byName 兜底：3.3.5 的 Tooltip 等级文本可能与法术书里的 subText 不完全一致（或读不到等级），
+-- 只按"名字+等级"找会让本来能恢复的技能报"法术书里找不到"。只在存档没记等级时才用 byName。
 local function ABP_BuildNeededSpellMap(neededSpellKeys)
-    local result = {}
-    if not neededSpellKeys or not next(neededSpellKeys) then return result end
+    local map = { exact = {}, byName = {} }
+    if not neededSpellKeys or not next(neededSpellKeys) then return map end
 
     local remaining = {}
     local remainingCount = 0
@@ -388,18 +444,19 @@ local function ABP_BuildNeededSpellMap(neededSpellKeys)
         if not name then break end
         for s = offset + 1, offset + numSpells do
             local n, r = GetSpellName(s, BOOKTYPE_SPELL)
-            local key = ABP_ComposeSpellKey(n, (r ~= "" and r or nil))
-            if key and remaining[key] then
-                result[key] = s
-                remaining[key] = nil
-                remainingCount = remainingCount - 1
-                if remainingCount == 0 then
-                    return result
+            if n and n ~= "" then
+                if map.byName[n] == nil then map.byName[n] = s end
+                local key = ABP_ComposeSpellKey(n, (r ~= "" and r or nil))
+                if key and remaining[key] then
+                    map.exact[key] = s
+                    remaining[key] = nil
+                    remainingCount = remainingCount - 1
                 end
             end
         end
+        if remainingCount == 0 then break end -- 需要的技能全找到了，后面的页不用再扫
     end
-    return result
+    return map
 end
 
 -- 遍历 19 个装备位，构建"物品名 -> 装备槽位"映射（找齐即停）
@@ -466,10 +523,16 @@ end
 
 -- 加载配置到动作条（完全覆盖当前布局）
 -- 先预构建技能/物品映射表，再按槽位回填；配置中为空的槽位会被清空
+-- 3.3.5 上拾取/放置类 API 受战斗限制，战斗中调用会被拒绝：这里改为"记下来，脱战后自动补做"
 function ABP_LoadProfile(profileName)
     if not ABP_PlayerName or not ABP_Layout or not ABP_Layout[ABP_PlayerName]
        or not ABP_Layout[ABP_PlayerName][profileName] then
         ABP_Msg('配置文件 "' .. tostring(profileName) .. '" 以前没有保存，无法加载.')
+        return
+    end
+
+    if ABP_InCombat() then
+        ABP_QueueLoad(profileName)
         return
     end
 
@@ -492,18 +555,18 @@ function ABP_LoadProfile(profileName)
         if itemName and itemName ~= "" then neededItemNames[itemName] = true end
     end
 
-    local spellKeyToId   = ABP_BuildNeededSpellMap(neededSpellKeys)
-    local equipItemToId  = ABP_FindItemsInEquipment(neededItemNames)
+    local spellMap      = ABP_BuildNeededSpellMap(neededSpellKeys)
+    local equipItemToId = ABP_FindItemsInEquipment(neededItemNames)
 
+    local bagItemToLoc
     do
         -- 只在装备位上找不到的物品，才继续去背包里找
         local remaining = {}
         for name in pairs(neededItemNames) do
             if not equipItemToId[name] then remaining[name] = true end
         end
-        var_bagMap = ABP_FindItemsInBags(remaining) -- 遗留的全局变量，仅作返回值暂存
+        bagItemToLoc = ABP_FindItemsInBags(remaining)
     end
-    local bagItemToLoc = var_bagMap or {}
 
     ABP_TooltipAttach()
     local scStatus = GetCVar("autoSelfCast")
@@ -512,12 +575,16 @@ function ABP_LoadProfile(profileName)
     local placedCount, clearedCount = 0, 0
     local missed = {} -- 存档里有、这次没能放回去的槽位（原因一起记下来）
 
-    for i = 1, MAX_ACTIONS do
+    for i = 1, ABP_MAX_SLOTS do
         repeat
             local sp = spells[i]
             if sp then
                 local key = ABP_ComposeSpellKey(sp.name, sp.rank)
-                local sid = key and spellKeyToId[key] or nil
+                local sid = key and spellMap.exact[key] or nil
+                if not sid and (not sp.rank or sp.rank == "") then
+                    -- 存档里没记等级（3.3.5 上 Tooltip 读不到等级时会出现）：只按技能名兜底
+                    sid = spellMap.byName[sp.name]
+                end
                 if sid then
                     PickupSpell(sid, BOOKTYPE_SPELL)
                     PlaceAction(i)
@@ -672,13 +739,30 @@ end
 -- 插件加载：注册事件与斜杠命令
 function ABP_OnLoad()
     this:RegisterEvent("VARIABLES_LOADED")
+    if ABP_IS_MODERN then
+        -- 只有支持该事件的新客户端才注册：用来补做战斗中推迟的加载（1.12 没有战斗锁定，不需要）
+        this:RegisterEvent("PLAYER_REGEN_ENABLED")
+    end
     SLASH_ABP1 = "/abprofile"
     SlashCmdList["ABP"] = function(msg) ABP_SlashCommand(msg or "") end
 end
 
--- 事件分发：只在 VARIABLES_LOADED 时做初始化（纯手动插件，不监听动作条事件）
-function ABP_OnEvent()
-    if event ~= "VARIABLES_LOADED" then return end
+-- 事件分发：VARIABLES_LOADED 时初始化；3.3.5 上再用 PLAYER_REGEN_ENABLED 补做被战斗推迟的加载
+-- （事件名显式传入：XML 里写 ABP_OnEvent(event)，1.12 与 3.3.5 都支持这么取全局 event）
+function ABP_OnEvent(ev)
+    ev = ev or event
+
+    if ev == "PLAYER_REGEN_ENABLED" then
+        local pending = ABP_PendingLoad
+        if pending then
+            ABP_PendingLoad = nil
+            ABP_Msg("|cff33aaff[ABP]|r 战斗结束，加载推迟的配置 \"" .. pending .. "\".")
+            ABP_LoadProfile(pending)
+        end
+        return
+    end
+
+    if ev ~= "VARIABLES_LOADED" then return end
 
     ABP_PlayerName = UnitName("player") .. " of " .. GetCVar("realmName")
 
@@ -770,48 +854,55 @@ end
 
 -- 构建小地图按钮的下拉菜单
 -- 含三级：主菜单（加载/保存/删除）、保存子菜单、删除子菜单
-function ABP_DropDownMenu_OnLoad()
+-- 菜单项回调把配置名"提前捕获"进闭包，不再靠 this 取按钮文本（1.12 传 this、3.3.5 习惯 self，闭包两版都不会踩空）
+-- owner 统一取下拉菜单的父级：1.12 与 3.3.5 的初始化回调都会把下拉菜单传进来，取不到才回落到 this
+function ABP_DropDownMenu_OnLoad(menu)
+    menu = menu or this
+    local owner = menu and menu:GetParent() or nil
+
     if UIDROPDOWNMENU_MENU_VALUE == "Delete menu" then
         UIDropDownMenu_AddButton({
             text = "选择要删除的布局",
             isTitle = true,
-            owner = this:GetParent(),
+            owner = owner,
             justifyH = "CENTER",
         }, UIDROPDOWNMENU_MENU_LEVEL)
 
         local list = ABP_Layout and ABP_Layout[ABP_PlayerName] or nil
         if list then
             for profileName in pairs(list) do
+                local pname = profileName
                 UIDropDownMenu_AddButton({
-                    text = profileName,
-                    value = profileName,
-                    func = function() ABP_RemoveProfile(this:GetText()) end,
+                    text = pname,
+                    value = pname,
+                    func = function() ABP_RemoveProfile(pname) end,
                     notCheckable = 1,
-                    owner = this:GetParent(),
+                    owner = owner,
                 }, UIDROPDOWNMENU_MENU_LEVEL)
             end
         end
         return
     end
 
-    -- 新增：保存子菜单
+    -- 保存子菜单
     if UIDROPDOWNMENU_MENU_VALUE == "Save menu" then
         UIDropDownMenu_AddButton({
             text = "选择要覆盖的布局",
             isTitle = true,
-            owner = this:GetParent(),
+            owner = owner,
             justifyH = "CENTER",
         }, UIDROPDOWNMENU_MENU_LEVEL)
 
         local list = ABP_Layout and ABP_Layout[ABP_PlayerName] or nil
         if list then
             for profileName in pairs(list) do
+                local pname = profileName
                 UIDropDownMenu_AddButton({
-                    text = profileName,
-                    value = profileName,
-                    func = function() ABP_SaveProfile(this:GetText()) end,
+                    text = pname,
+                    value = pname,
+                    func = function() ABP_SaveProfile(pname) end,
                     notCheckable = 1,
-                    owner = this:GetParent(),
+                    owner = owner,
                 }, UIDROPDOWNMENU_MENU_LEVEL)
             end
         end
@@ -820,27 +911,28 @@ function ABP_DropDownMenu_OnLoad()
             text = "新建...",
             func = function() StaticPopup_Show("ABP_NewProfile") end,
             notCheckable = 1,
-            owner = this:GetParent(),
+            owner = owner,
         }, UIDROPDOWNMENU_MENU_LEVEL)
         return
     end
 
-    -- 原默认菜单
+    -- 主菜单
     UIDropDownMenu_AddButton({
         text = UnitName("player") .. "的动作条",
         isTitle = true,
-        owner = this:GetParent(),
+        owner = owner,
         justifyH = "CENTER",
     }, UIDROPDOWNMENU_MENU_LEVEL)
 
     local list = ABP_Layout and ABP_Layout[ABP_PlayerName] or nil
     if list then
         for profileName in pairs(list) do
+            local pname = profileName
             UIDropDownMenu_AddButton({
-                text = profileName,
-                func = function() ABP_LoadProfile(this:GetText()) end,
+                text = pname,
+                func = function() ABP_LoadProfile(pname) end,
                 notCheckable = 1,
-                owner = this:GetParent(),
+                owner = owner,
             }, UIDROPDOWNMENU_MENU_LEVEL)
         end
     end
@@ -851,13 +943,13 @@ function ABP_DropDownMenu_OnLoad()
         justifyH = "CENTER",
     }, UIDROPDOWNMENU_MENU_LEVEL)
 
-    -- 原"保存当前动作条的布局"改为带有子菜单的按钮
+    -- "保存当前动作条的布局"带子菜单
     UIDropDownMenu_AddButton({
         text = "保存当前动作条的布局",
         value = "Save menu",
         notCheckable = 1,
         hasArrow = true,
-        owner = this:GetParent(),
+        owner = owner,
     }, UIDROPDOWNMENU_MENU_LEVEL)
 
     UIDropDownMenu_AddButton({
@@ -865,6 +957,7 @@ function ABP_DropDownMenu_OnLoad()
         value = "Delete menu",
         notCheckable = 1,
         hasArrow = true,
+        owner = owner,
     }, UIDROPDOWNMENU_MENU_LEVEL)
 end
 
@@ -897,20 +990,26 @@ function ABPButton_SetPosition(v)
 end
 
 -- 新建配置名的输入对话框（菜单"新建..."触发）
+-- 取输入框统一走 ABP_GetPopupEditBox：1.12 回调传"确定按钮"，3.3.5 传"弹窗本身"，两种都兜住
 StaticPopupDialogs["ABP_NewProfile"] = {
     text = "为当前动作条保存输入一个名称",
     button1 = SAVE,
     button2 = CANCEL,
-    OnAccept = function()
-        local profileName = getglobal(this:GetParent():GetName() .. "EditBox"):GetText()
+    OnAccept = function(self)
+        local box = ABP_GetPopupEditBox(self)
+        if not box then return end
+        local profileName = box:GetText()
         ABP_SaveProfile(profileName)
-        getglobal(this:GetParent():GetName() .. "EditBox"):SetText("")
+        box:SetText("")
     end,
-    EditBoxOnEnterPressed = function()
-        local profileName = this:GetText()
+    EditBoxOnEnterPressed = function(self)
+        local box = self or this
+        if not box then return end
+        local profileName = box:GetText()
         ABP_SaveProfile(profileName)
-        this:SetText("")
-        this:GetParent():Hide()
+        box:SetText("")
+        local popup = box:GetParent()
+        if popup then popup:Hide() end
     end,
     timeout = 0,
     whileDead = true,

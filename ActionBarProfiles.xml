@@ -32,10 +32,10 @@
 				this.dragme = false;
 			</OnLoad>
 			<OnEvent>
-				ABP_OnEvent();
+				ABP_OnEvent(event);
 			</OnEvent>
 			<OnClick>
-				ToggleDropDownMenu(1, nil, ABP_DropDownMenu, ActionBarProfiles_IconFrame, 0, 0);
+				ToggleDropDownMenu(1, nil, ABP_DropDownMenu, "ActionBarProfiles_IconFrame", 0, 0);
 			</OnClick>
 			<OnUpdate>
 				if (this.dragme == true) then
