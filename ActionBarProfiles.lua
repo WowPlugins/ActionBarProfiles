@@ -38,6 +38,8 @@ local CMD_LOAD   = "加载"
 local CMD_REMOVE = "删除"
 local CMD_LIST   = "列表"
 local CMD_CHECK  = "对比"
+local CMD_EXPORT = "导出"
+local CMD_IMPORT = "导入"
 local CMD_DEBUG  = "debug"
 
 -- 判断表中是否有元素（用于空配置检测）
@@ -131,6 +133,192 @@ local function ABP_TooltipAttach()
     end
 end
 
+-- ===== 宏读取与重建 =====
+-- 保存时除了宏名，还记录宏体/图标/是否角色专用，供"便携字符串"和跨角色导入后重建。
+-- 重建规则：先按名字找 → 再按宏体找（已有同宏体的宏直接复用，不改名、不新建）→ 最后才新建。
+local ABP_MacroIconIndex = nil
+
+-- 宏图标贴图 → 图标序号（CreateMacro 需要序号；缓存一次，建宏时才扫）
+local function ABP_GetMacroIconIndex(texture)
+    if not texture or texture == "" then return nil end
+    if not ABP_MacroIconIndex then
+        ABP_MacroIconIndex = {}
+        local count = (GetNumMacroIcons and GetNumMacroIcons()) or 0
+        for i = 1, count do
+            local path = GetMacroIconInfo(i)
+            if path then ABP_MacroIconIndex[path] = i end
+        end
+    end
+    return ABP_MacroIconIndex[texture]
+end
+
+-- 按名字找宏序号：优先用 GetMacroIndexByName，没有该接口时退回逐个扫（1.12 也兜住）
+local function ABP_FindMacroIndexByName(name)
+    if not name or name == "" then return nil end
+    if GetMacroIndexByName then
+        local idx = GetMacroIndexByName(name)
+        if idx and idx > 0 then return idx end
+    end
+    for i = 1, 54 do
+        local mname = GetMacroInfo(i)
+        if mname == name then return i end
+    end
+    return nil
+end
+
+-- 按宏体找宏序号：用于"按宏体去重"，避免同内容的宏被重复创建
+local function ABP_FindMacroIndexByBody(body)
+    if not body or body == "" then return nil end
+    for i = 1, 54 do
+        local _, _, mbody = GetMacroInfo(i)
+        if mbody == body then return i end
+    end
+    return nil
+end
+
+-- 读取一个宏的完整信息（名字/图标/宏体/是否角色专用）；indexOrName 可传序号或宏名
+local function ABP_ReadMacroInfo(indexOrName)
+    local idx = indexOrName
+    if type(indexOrName) == "string" then idx = ABP_FindMacroIndexByName(indexOrName) end
+    if not idx or idx <= 0 then return nil end
+
+    local name, icon, body, isLocal = GetMacroInfo(idx)
+    if not name or not body then return nil end
+
+    -- 部分客户端会多返回一个"是否角色专用"；读不到时用全局宏数量判断分界（全局宏排在序号前面）
+    local perchar = isLocal
+    if perchar == nil then
+        local numGlobal = 0
+        if GetNumMacros then
+            local _, globalCount = GetNumMacros()
+            numGlobal = globalCount or 0
+        end
+        perchar = (numGlobal > 0) and (idx > numGlobal) or false
+    end
+
+    return {
+        icon = icon or "",
+        body = body,
+        perchar = (perchar and "1" or "0"),
+    }
+end
+
+-- 确保某个宏存在，返回宏序号；失败时返回 nil + 原因
+-- macroBodies: profile.macroBodies，键是宏名，值是 { icon, body, perchar }
+local function ABP_EnsureMacro(mname, macroBodies)
+    if not mname or mname == "" then return nil end
+
+    local idx = ABP_FindMacroIndexByName(mname)
+    if idx then return idx end
+
+    local info = macroBodies and macroBodies[mname]
+    if not info or not info.body or info.body == "" then
+        return nil, "找不到这个宏"
+    end
+
+    -- 已有同宏体的宏：直接复用，不改名、不新建（跨账号导入时不破坏对方已有宏）
+    idx = ABP_FindMacroIndexByBody(info.body)
+    if idx then return idx end
+
+    local iconIndex = ABP_GetMacroIconIndex(info.icon) or 1
+    local newIdx = CreateMacro(mname, iconIndex, info.body, (info.perchar == "1"))
+    if newIdx then return newIdx end
+    return nil, "没有空余的宏位"
+end
+
+-- ===== 按键绑定：保存 / 恢复 =====
+-- 只处理动作条按钮的绑定命令（主条、各附加条、奖励条），不碰移动/聊天等其它按键。
+-- 绑定跟着按钮走，而不是跟着动作槽走：主条翻页时同一组 ACTIONBUTTON 键位仍然有效。
+local ABP_BINDING_PATTERNS = {
+    "^ACTIONBUTTON%d+$",
+    "^MULTIACTIONBAR%d+BUTTON%d+$",
+    "^BONUSACTIONBUTTON%d+$",
+}
+
+local function ABP_IsActionBarBinding(command)
+    if not command or command == "" then return false end
+    for k = 1, #ABP_BINDING_PATTERNS do
+        if string.find(command, ABP_BINDING_PATTERNS[k]) then return true end
+    end
+    return false
+end
+
+-- 读取当前动作条按键绑定：返回 { [command] = { key1, key2 } }
+-- 有枚举接口就枚举（自动覆盖客户端实际存在的所有动作条），没有就按已知命令逐个查。
+local function ABP_CollectBindings()
+    local result = {}
+    if GetNumBindings and GetBinding then
+        local count = GetNumBindings() or 0
+        for i = 1, count do
+            local command, key1, key2 = GetBinding(i)
+            if ABP_IsActionBarBinding(command) and key1 then
+                result[command] = { key1, key2 }
+            end
+        end
+        return result
+    end
+
+    for n = 1, 12 do
+        local commands = {
+            "ACTIONBUTTON" .. n,
+            "BONUSACTIONBUTTON" .. n,
+        }
+        for bar = 1, 6 do
+            commands[#commands + 1] = "MULTIACTIONBAR" .. bar .. "BUTTON" .. n
+        end
+        for k = 1, #commands do
+            local command = commands[k]
+            if GetBindingKey then
+                local key1, key2 = GetBindingKey(command)
+                if key1 then result[command] = { key1, key2 } end
+            end
+        end
+    end
+    return result
+end
+
+-- 用存档里的键位完整覆盖当前动作条按键：
+--   1) 先清掉当前所有动作条命令的键位（存档里没记录的旧键位不会残留）；
+--   2) 再逐条设置存档里的键；
+--   3) 若某个键当前被非动作条命令占用，则跳过并记录冲突，避免误伤其它按键。
+-- 返回 恢复的键位数量, 冲突说明列表
+local function ABP_ApplyBindings(saved)
+    if not saved or not SetBinding then return 0, {} end
+
+    -- 先清掉当前所有动作条键位，再按存档重建；这样存档里没有的旧键位不会残留
+    local current = ABP_CollectBindings()
+    for _, keys in pairs(current) do
+        if keys[1] then SetBinding(keys[1], nil) end
+        if keys[2] then SetBinding(keys[2], nil) end
+    end
+
+    local applied = 0
+    local conflicts = {}
+    for command, keys in pairs(saved) do
+        if ABP_IsActionBarBinding(command) then
+            for k = 1, 2 do
+                local key = keys[k]
+                if key and key ~= "" then
+                    local existing = GetBindingAction and GetBindingAction(key) or nil
+                    if existing and existing ~= "" and existing ~= command
+                       and not ABP_IsActionBarBinding(existing) then
+                        conflicts[#conflicts + 1] = key .. " 已被 " .. existing .. " 占用，未覆盖"
+                    else
+                        SetBinding(key, command)
+                        applied = applied + 1
+                    end
+                end
+            end
+        end
+    end
+
+    if SaveBindings then
+        local set = GetCurrentBindingSet and GetCurrentBindingSet() or 1
+        SaveBindings(set)
+    end
+    return applied, conflicts
+end
+
 -- ===== 保存任务 =====
 -- 一帧之内对几十个槽位做 SetAction（生成 Tooltip）+ PickupAction/PlaceAction 会造成明显卡顿，
 -- 所以保存拆到多帧执行；而且只有真的发生变化的动作条才会走到这里（见上面的触发源）。
@@ -172,6 +360,12 @@ local function ABP_ScanSlot(dest, i)
         ABP_SlotName[i] = macroText
         ABP_SlotRank[i] = nil
         dest.macros[i] = macroText
+        -- 一并记录宏体/图标/是否角色专用：导出成便携字符串后，换角色/换账号也能重建宏
+        local details = ABP_ReadMacroInfo(macroText)
+        if details then
+            if not dest.macroBodies then dest.macroBodies = {} end
+            dest.macroBodies[macroText] = details
+        end
         return
     end
 
@@ -236,6 +430,10 @@ local function ABP_CarryOverUnreadable(previous, dest)
                 carried = carried + 1
             elseif mc then
                 dest.macros[i] = mc
+                if previous.macroBodies and previous.macroBodies[mc] then
+                    if not dest.macroBodies then dest.macroBodies = {} end
+                    dest.macroBodies[mc] = previous.macroBodies[mc]
+                end
                 carried = carried + 1
             elseif it then
                 dest.items[i] = it
@@ -332,6 +530,7 @@ function ABP_SaveProfile(profileName, silent)
             spells = {},  -- [slot] = { name=, rank= }
             macros = {},  -- [slot] = macroName
             items  = {},  -- [slot] = itemName
+            macroBodies = {}, -- [macroName] = { icon=, body=, perchar= }
         },
         previous = ABP_Layout[ABP_PlayerName][profileName],
         scStatus = GetCVar("autoSelfCast"),
@@ -392,6 +591,9 @@ function ABP_RunSaveJob()
 
     ABP_Dbg('写入 "' .. job.name .. '"：' .. ABP_DiffSummary(job.previous, job.dest))
 
+    -- 按键绑定跟动作条一起存：绑定的是按钮，不是槽位内容
+    job.dest.bindings = ABP_CollectBindings()
+
     ABP_Layout[ABP_PlayerName][job.name] = job.dest
     if not job.silent then
         ABP_Msg('配置文件 "' .. job.name .. '" 已保存.')
@@ -414,7 +616,7 @@ function ABP_StartVerifyJob(profileName)
         slotsPerFrame = ABP_ScanOnlySlotsPerFrame,
         phase = "scan",
         i = 0,
-        dest = { spells = {}, macros = {}, items = {} },
+        dest = { spells = {}, macros = {}, items = {}, macroBodies = {} },
         scStatus = GetCVar("autoSelfCast"),
     }
 
@@ -543,6 +745,7 @@ function ABP_LoadProfile(profileName)
     local spells = profile.spells or {}
     local macros = profile.macros or {}
     local items  = profile.items  or {}
+    local macroBodies = profile.macroBodies or {}
 
     local neededSpellKeys = {}
     local neededItemNames = {}
@@ -604,13 +807,16 @@ function ABP_LoadProfile(profileName)
             local mname = macros[i]
             if mname and mname ~= "" then
                 local picked = false
+                local why = nil
                 if GetSuperMacroInfo and GetSuperMacroInfo(mname, "texture") then
                     PickupMacro(0, mname)
                     PlaceAction(i)
                     ClearCursor() -- 清空光标残留
                     picked = true
                 else
-                    local idx = GetMacroIndexByName(mname)
+                    -- 先按名字找；找不到就按存档里的宏体重建（同宏体的已有宏直接复用，不会重复创建）
+                    local idx
+                    idx, why = ABP_EnsureMacro(mname, macroBodies)
                     if idx and idx > 0 then
                         PickupMacro(idx)
                         PlaceAction(i)
@@ -625,7 +831,8 @@ function ABP_LoadProfile(profileName)
                     -- 找不到这个宏，但槽位上挂的就是它：算它已经到位
                     placedCount = placedCount + 1
                 else
-                    table.insert(missed, "宏 槽" .. i .. " " .. mname .. "（找不到这个宏）")
+                    table.insert(missed, "宏 槽" .. i .. " " .. mname
+                        .. "（" .. (why or "找不到这个宏") .. "）")
                 end
                 break
             end
@@ -666,8 +873,27 @@ function ABP_LoadProfile(profileName)
     end
     SetCVar("autoSelfCast", scStatus)
 
+    -- 按键绑定：完整覆盖存档里的动作条键位；老存档没有 bindings 字段时不动当前键位
+    local bindingCount, bindingConflicts = nil, nil
+    if profile.bindings then
+        bindingCount, bindingConflicts = ABP_ApplyBindings(profile.bindings)
+    end
+
     ABP_Msg('配置文件 "' .. profileName .. '" 已加载：放回 ' .. placedCount .. " 个槽位，清空 "
         .. clearedCount .. " 个。")
+    if bindingCount then
+        ABP_Msg("  按键绑定：恢复 " .. bindingCount .. " 个键位.")
+    end
+    if bindingConflicts and #bindingConflicts > 0 then
+        ABP_Msg("|cffff5555[ABP]|r 有 " .. #bindingConflicts .. " 个键位被其它功能占用，未覆盖：")
+        for k = 1, #bindingConflicts do
+            if k > 3 then
+                ABP_Msg("  …还有 " .. (#bindingConflicts - 3) .. " 个")
+                break
+            end
+            ABP_Msg("  " .. bindingConflicts[k])
+        end
+    end
     if table.getn(missed) > 0 then
         ABP_Msg("|cffff5555[ABP]|r 有 " .. table.getn(missed)
             .. " 个槽位没能恢复（会保持原样，所以看起来跟存档不一致）：")
@@ -683,6 +909,368 @@ function ABP_LoadProfile(profileName)
     -- 3 秒后自检一次：把当前动作条跟这份存档逐槽比一遍，直接回答"完全覆盖到底有没有生效"
     ABP_VerifyAt = GetTime() + 3
     ABP_VerifyProfile = profileName
+end
+
+-- ===== 便携字符串：导出 / 导入 =====
+-- 安全设计：只做纯数据序列化/反序列化，绝不 loadstring 执行字符串内容。
+-- 格式：前缀 "ABP1:" + Base64( 一串 netstring 字段 )
+--   netstring 字段 = "#长度:内容"；长度由数据自己给出，所以宏体里的换行、引号、分隔符都不用转义。
+local ABP_PORTABLE_TAG = "ABP1:"
+local ABP_PORTABLE_VERSION = "2" -- 2：在技能/宏/物品之后追加动作条按键段；仍兼容读取 1
+
+local ABP_B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local ABP_B64_INDEX = {}
+for i = 1, 64 do
+    ABP_B64_INDEX[string.sub(ABP_B64_CHARS, i, i)] = i - 1
+end
+
+local function ABP_Base64Encode(data)
+    local out = {}
+    local size = string.len(data)
+    local i = 1
+    while i <= size do
+        local b1 = string.byte(data, i)
+        local b2 = string.byte(data, i + 1)
+        local b3 = string.byte(data, i + 2)
+        local n = b1 * 65536 + (b2 or 0) * 256 + (b3 or 0)
+        local c1 = math.floor(n / 262144) % 64
+        local c2 = math.floor(n / 4096) % 64
+        local c3 = math.floor(n / 64) % 64
+        local c4 = n % 64
+        out[#out + 1] = string.sub(ABP_B64_CHARS, c1 + 1, c1 + 1)
+        out[#out + 1] = string.sub(ABP_B64_CHARS, c2 + 1, c2 + 1)
+        out[#out + 1] = b2 and string.sub(ABP_B64_CHARS, c3 + 1, c3 + 1) or "="
+        out[#out + 1] = b3 and string.sub(ABP_B64_CHARS, c4 + 1, c4 + 1) or "="
+        i = i + 3
+    end
+    return table.concat(out)
+end
+
+local function ABP_Base64Decode(data)
+    if not data or data == "" then return nil end
+    data = string.gsub(data, "[^%w%+/=]", "")
+    local out = {}
+    local buffer, bits = 0, 0
+    for i = 1, string.len(data) do
+        local ch = string.sub(data, i, i)
+        if ch ~= "=" then
+            local v = ABP_B64_INDEX[ch]
+            if not v then return nil end
+            buffer = buffer * 64 + v
+            bits = bits + 6
+            if bits >= 8 then
+                bits = bits - 8
+                local divisor = 2 ^ bits
+                out[#out + 1] = string.char(math.floor(buffer / divisor) % 256)
+                buffer = buffer % divisor
+            end
+        end
+    end
+    return table.concat(out)
+end
+
+-- 打包成 netstring 序列
+local function ABP_PackFields(fields)
+    local out = {}
+    for i = 1, #fields do
+        local v = tostring(fields[i] == nil and "" or fields[i])
+        out[#out + 1] = "#" .. string.len(v) .. ":" .. v
+    end
+    return table.concat(out)
+end
+
+-- 反解 netstring 序列：成功返回字段数组，格式不对返回 nil
+local function ABP_ReadFields(data)
+    local fields = {}
+    local pos = 1
+    local size = string.len(data)
+    while pos <= size do
+        if string.sub(data, pos, pos) ~= "#" then return nil end
+        local colon = string.find(data, ":", pos + 1, true)
+        if not colon then return nil end
+        local n = tonumber(string.sub(data, pos + 1, colon - 1))
+        if not n or n < 0 or colon + n > size then return nil end
+        fields[#fields + 1] = string.sub(data, colon + 1, colon + n)
+        pos = colon + n + 1
+    end
+    return fields
+end
+
+-- 取出表里所有数字键并排序，保证导出顺序稳定（便于比对/复现）
+local function ABP_SortedSlotList(t)
+    local list = {}
+    if t then
+        for k in pairs(t) do
+            if type(k) == "number" then list[#list + 1] = k end
+        end
+    end
+    table.sort(list)
+    return list
+end
+
+local function ABP_CountEntries(t)
+    local n = 0
+    if t then
+        for _ in pairs(t) do n = n + 1 end
+    end
+    return n
+end
+
+-- 把一份配置打包成字符串（不含前缀/Base64 之外的任何加工）
+local function ABP_BuildPortablePayload(name, profile)
+    local fields = {}
+    local function add(v) fields[#fields + 1] = v end
+
+    add(ABP_PORTABLE_VERSION)
+    add(name)
+
+    local spellSlots = ABP_SortedSlotList(profile.spells)
+    add(#spellSlots)
+    for _, slot in ipairs(spellSlots) do
+        local s = profile.spells[slot]
+        add(slot); add(s.name or ""); add(s.rank or "")
+    end
+
+    local macroSlots = ABP_SortedSlotList(profile.macros)
+    local bodies = profile.macroBodies or {}
+    add(#macroSlots)
+    for _, slot in ipairs(macroSlots) do
+        local mname = profile.macros[slot] or ""
+        -- 优先用存档里的宏信息；老存档没有时现场向客户端读一次（本机存在同名宏才读得到）
+        local info = bodies[mname] or ABP_ReadMacroInfo(mname) or {}
+        add(slot); add(mname); add(info.body or ""); add(info.icon or ""); add(info.perchar or "0")
+    end
+
+    local itemSlots = ABP_SortedSlotList(profile.items)
+    add(#itemSlots)
+    for _, slot in ipairs(itemSlots) do
+        add(slot); add(profile.items[slot] or "")
+    end
+
+    -- 按键段：命令名 + 主键 + 副键；只导出动作条按钮的绑定
+    local bindings = profile.bindings or {}
+    local commands = {}
+    for command in pairs(bindings) do
+        if ABP_IsActionBarBinding(command) then commands[#commands + 1] = command end
+    end
+    table.sort(commands)
+    add(#commands)
+    for _, command in ipairs(commands) do
+        local keys = bindings[command]
+        add(command); add(keys[1] or ""); add(keys[2] or "")
+    end
+
+    return ABP_PackFields(fields)
+end
+
+-- 解析便携字符串；成功返回 profile 表，失败返回 nil + 原因
+local function ABP_ParsePortable(text)
+    local raw = string.gsub(text or "", "%s+", "")
+    if string.sub(raw, 1, string.len(ABP_PORTABLE_TAG)) ~= ABP_PORTABLE_TAG then
+        return nil, "不是本插件的便携字符串（应以 ABP1: 开头）"
+    end
+
+    local payload = ABP_Base64Decode(string.sub(raw, string.len(ABP_PORTABLE_TAG) + 1))
+    if not payload then return nil, "Base64 解码失败，字符串可能被截断" end
+
+    local fields = ABP_ReadFields(payload)
+    if not fields then return nil, "字符串内容已损坏" end
+
+    local pos = 0
+    local function take()
+        pos = pos + 1
+        return fields[pos]
+    end
+    local function takeText() return take() or "" end
+    local function takeNum()
+        local v = take()
+        if v == nil then return nil end
+        return tonumber(v)
+    end
+
+    local version = take()
+    if version ~= "1" and version ~= "2" then return nil, "不支持的便携字符串版本" end
+
+    local name = take()
+    if not name or name == "" then return nil, "配置名为空" end
+
+    local profile = { name = name, spells = {}, macros = {}, items = {}, macroBodies = {} }
+    local skipped = 0
+    local function slotOK(slot)
+        if slot and slot >= 1 and slot <= ABP_MAX_SLOTS then return true end
+        skipped = skipped + 1
+        return false
+    end
+
+    local n = takeNum()
+    if not n or n < 0 or n > ABP_MAX_SLOTS then return nil, "技能段数量异常" end
+    for _ = 1, n do
+        local slot = takeNum()
+        local spellName = takeText()
+        local rank = takeText()
+        if not slot or spellName == "" then return nil, "技能段数据不完整" end
+        if slotOK(slot) then
+            profile.spells[slot] = { name = spellName, rank = (rank ~= "" and rank or nil) }
+        end
+    end
+
+    n = takeNum()
+    if not n or n < 0 or n > ABP_MAX_SLOTS then return nil, "宏段数量异常" end
+    for _ = 1, n do
+        local slot = takeNum()
+        local mname = takeText()
+        local body = takeText()
+        local icon = takeText()
+        local perchar = takeText()
+        if not slot or mname == "" then return nil, "宏段数据不完整" end
+        if slotOK(slot) then
+            profile.macros[slot] = mname
+            if body ~= "" and not profile.macroBodies[mname] then
+                profile.macroBodies[mname] = {
+                    body = body,
+                    icon = icon,
+                    perchar = (perchar == "1" and "1" or "0"),
+                }
+            end
+        end
+    end
+
+    n = takeNum()
+    if not n or n < 0 or n > ABP_MAX_SLOTS then return nil, "物品段数量异常" end
+    for _ = 1, n do
+        local slot = takeNum()
+        local itemName = takeText()
+        if not slot or itemName == "" then return nil, "物品段数据不完整" end
+        if slotOK(slot) then
+            profile.items[slot] = itemName
+        end
+    end
+
+    -- 版本 2 才带按键段；版本 1 没有这段，导入后不会改动当前按键绑定
+    if version == "2" then
+        n = takeNum()
+        if not n or n < 0 or n > 1000 then return nil, "按键段数量异常" end
+        profile.bindings = {}
+        for _ = 1, n do
+            local command = takeText()
+            local key1 = takeText()
+            local key2 = takeText()
+            if command == "" then return nil, "按键段数据不完整" end
+            -- 只接受动作条按钮命令，避免导入字符串把任意命令绑到键上
+            if ABP_IsActionBarBinding(command) then
+                profile.bindings[command] = {
+                    (key1 ~= "" and key1 or nil),
+                    (key2 ~= "" and key2 or nil),
+                }
+            end
+        end
+    end
+
+    return profile, nil, skipped
+end
+
+-- 把一份配置编码成可复制/粘贴的便携字符串
+function ABP_BuildPortableString(profileName)
+    local profile = ABP_PlayerName and ABP_Layout and ABP_Layout[ABP_PlayerName]
+        and ABP_Layout[ABP_PlayerName][profileName]
+    if not profile then
+        return nil, '配置 "' .. tostring(profileName) .. '" 还没有保存过'
+    end
+    return ABP_PORTABLE_TAG .. ABP_Base64Encode(ABP_BuildPortablePayload(profileName, profile))
+end
+
+-- 待确认覆盖的导入结果（弹窗确认后才真正写入）
+local ABP_PendingImport = nil
+
+local function ABP_StoreImportedProfile(profile)
+    if not ABP_PlayerName then return false end
+    if not ABP_Layout then ABP_Layout = {} end
+    if not ABP_Layout[ABP_PlayerName] then ABP_Layout[ABP_PlayerName] = {} end
+    ABP_Layout[ABP_PlayerName][profile.name] = {
+        spells = profile.spells or {},
+        macros = profile.macros or {},
+        items = profile.items or {},
+        macroBodies = profile.macroBodies or {},
+        bindings = profile.bindings,
+    }
+    return true
+end
+
+-- 从字符串导入一份配置：只写入 SavedVariables，不会立刻动动作条
+function ABP_ImportFromString(text)
+    if not ABP_PlayerName then
+        ABP_Msg("|cffff5555[ABP]|r 角色信息还没加载完成，稍后再试.")
+        return false
+    end
+
+    local profile, err, skipped = ABP_ParsePortable(text)
+    if not profile then
+        ABP_Msg("|cffff5555[ABP]|r 导入失败：" .. (err or "字符串内容无法识别"))
+        return false
+    end
+
+    local existing = ABP_Layout and ABP_Layout[ABP_PlayerName]
+        and ABP_Layout[ABP_PlayerName][profile.name]
+    if existing then
+        ABP_PendingImport = profile
+        StaticPopup_Show("ABP_ImportOverwrite", profile.name)
+        return true
+    end
+
+    ABP_StoreImportedProfile(profile)
+    local importedMsg = '|cff33aaff[ABP]|r 已导入配置 "' .. profile.name .. '"：技能 '
+        .. ABP_CountEntries(profile.spells) .. " 个，宏 " .. ABP_CountEntries(profile.macros)
+        .. " 个，物品 " .. ABP_CountEntries(profile.items) .. " 个"
+    if profile.bindings then
+        importedMsg = importedMsg .. "，按键 " .. ABP_CountEntries(profile.bindings) .. " 个"
+    end
+    ABP_Msg(importedMsg .. ".")
+    if skipped and skipped > 0 then
+        ABP_Msg("  有 " .. skipped .. " 条槽位超出本客户端范围，已忽略.")
+    end
+    ABP_Msg('  用 /abprofile 加载 "' .. profile.name .. '" 或从菜单里点它即可应用.')
+    return true
+end
+
+-- 打开窗口并填入导出结果（全选，方便直接复制）
+function ABP_Portable_ShowExport(profileName)
+    local text, err = ABP_BuildPortableString(profileName)
+    if not text then
+        ABP_Msg("|cffff5555[ABP]|r " .. err)
+        return
+    end
+
+    local frame = getglobal("ABP_PortableFrame")
+    local box = getglobal("ABP_PortableFrameEditBox")
+    if not frame or not box then return end
+
+    frame:Show()
+    box:SetText(text)
+    box:HighlightText()
+    box:SetFocus()
+    ABP_Msg('配置 "' .. profileName .. '" 的便携字符串已生成并全选，复制后可在其他角色/账号导入.')
+end
+
+-- 打开窗口等待粘贴字符串
+function ABP_Portable_ShowImport()
+    local frame = getglobal("ABP_PortableFrame")
+    local box = getglobal("ABP_PortableFrameEditBox")
+    if not frame or not box then return end
+
+    frame:Show()
+    box:SetText("")
+    box:SetFocus()
+    ABP_Msg("把便携字符串粘贴到窗口里，然后点“导入”.")
+end
+
+-- 窗口“导入”按钮：读取输入框内容并导入
+function ABP_Portable_Import()
+    local box = getglobal("ABP_PortableFrameEditBox")
+    if not box then return end
+    if ABP_ImportFromString(box:GetText() or "") then
+        local frame = getglobal("ABP_PortableFrame")
+        if frame then frame:Hide() end
+    end
 end
 
 -- 列出当前角色的所有配置名
@@ -779,11 +1367,13 @@ end
 -- 命令提示：列出所有可用命令
 function ABP_PrintHelp()
     ABP_Msg("ActionBarProfiles - 动作条配置保存/加载（纯手动：不自动保存、不监听动作条）")
-    ABP_Msg("  /abprofile 保存 <名字>    把当前动作条存成配置")
-    ABP_Msg("  /abprofile 加载 <名字>    加载配置，完全覆盖当前动作条")
+    ABP_Msg("  /abprofile 保存 <名字>    把当前动作条和按键绑定存成配置")
+    ABP_Msg("  /abprofile 加载 <名字>    加载配置，完全覆盖当前动作条和按键绑定")
     ABP_Msg("  /abprofile 删除 <名字>    删除配置")
     ABP_Msg("  /abprofile 列表           列出本角色的所有配置")
     ABP_Msg("  /abprofile 对比 <名字>    把当前动作条跟该配置逐槽比一遍，列出差异")
+    ABP_Msg("  /abprofile 导出 <名字>    生成可复制/粘贴的便携字符串（含宏体与按键，可跨角色/账号）")
+    ABP_Msg("  /abprofile 导入           打开窗口，粘贴便携字符串导入成配置")
     ABP_Msg("  /abprofile debug          诊断输出开关（当前：" .. ABP_DebugLevel .. " 级）")
     ABP_Msg("不带参数的 /abprofile 就是这份提示.")
     ABP_Msg("ActionBarProfiles, 由Kronos的<Vanguard>制作, 60addons汉化")
@@ -817,6 +1407,24 @@ function ABP_SlashCommand(msg)
         else
             ABP_Msg("ActionBarProfiles 诊断输出已打开：会打印扫描/写入/比对的槽位差异.")
         end
+        return
+    end
+
+    -- 便携字符串导出：/abprofile 导出 <名字>
+    local exportName = string.match(cmd, "^" .. CMD_EXPORT .. "%s*(.*)$")
+    if exportName then
+        if exportName == "" then
+            ABP_Msg("用法: /abprofile 导出 <配置名>")
+            ABP_ListProfiles()
+        else
+            ABP_Portable_ShowExport(exportName)
+        end
+        return
+    end
+
+    -- 便携字符串导入：/abprofile 导入（打开粘贴窗口）
+    if string.sub(cmd, 1, string.len(CMD_IMPORT)) == CMD_IMPORT then
+        ABP_Portable_ShowImport()
         return
     end
 
@@ -916,6 +1524,31 @@ function ABP_DropDownMenu_OnLoad(menu)
         return
     end
 
+    -- 导出子菜单：选一个配置生成便携字符串
+    if UIDROPDOWNMENU_MENU_VALUE == "Export menu" then
+        UIDropDownMenu_AddButton({
+            text = "选择要导出的布局",
+            isTitle = true,
+            owner = owner,
+            justifyH = "CENTER",
+        }, UIDROPDOWNMENU_MENU_LEVEL)
+
+        local list = ABP_Layout and ABP_Layout[ABP_PlayerName] or nil
+        if list then
+            for profileName in pairs(list) do
+                local pname = profileName
+                UIDropDownMenu_AddButton({
+                    text = pname,
+                    value = pname,
+                    func = function() ABP_Portable_ShowExport(pname) end,
+                    notCheckable = 1,
+                    owner = owner,
+                }, UIDROPDOWNMENU_MENU_LEVEL)
+            end
+        end
+        return
+    end
+
     -- 主菜单
     UIDropDownMenu_AddButton({
         text = UnitName("player") .. "的动作条",
@@ -949,6 +1582,22 @@ function ABP_DropDownMenu_OnLoad(menu)
         value = "Save menu",
         notCheckable = 1,
         hasArrow = true,
+        owner = owner,
+    }, UIDROPDOWNMENU_MENU_LEVEL)
+
+    -- "导出配置为字符串"带子菜单
+    UIDropDownMenu_AddButton({
+        text = "导出配置为字符串",
+        value = "Export menu",
+        notCheckable = 1,
+        hasArrow = true,
+        owner = owner,
+    }, UIDROPDOWNMENU_MENU_LEVEL)
+
+    UIDropDownMenu_AddButton({
+        text = "从字符串导入...",
+        func = function() ABP_Portable_ShowImport() end,
+        notCheckable = 1,
         owner = owner,
     }, UIDROPDOWNMENU_MENU_LEVEL)
 
@@ -1015,5 +1664,28 @@ StaticPopupDialogs["ABP_NewProfile"] = {
     whileDead = true,
     hideOnEscape = true,
     hasEditBox = true,
+    preferredIndex = 3,
+}
+
+-- 导入时配置名已存在的覆盖确认
+StaticPopupDialogs["ABP_ImportOverwrite"] = {
+    text = '配置 "%1" 已存在，要用导入的内容覆盖吗？',
+    button1 = YES,
+    button2 = NO,
+    OnAccept = function()
+        local profile = ABP_PendingImport
+        ABP_PendingImport = nil
+        if profile and ABP_StoreImportedProfile(profile) then
+            ABP_Msg('|cff33aaff[ABP]|r 已覆盖导入配置 "' .. profile.name .. '".')
+            ABP_Msg('  用 /abprofile 加载 "' .. profile.name .. '" 或从菜单里点它即可应用.')
+        end
+    end,
+    OnCancel = function()
+        ABP_PendingImport = nil
+        ABP_Msg("已取消导入.")
+    end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
     preferredIndex = 3,
 }
