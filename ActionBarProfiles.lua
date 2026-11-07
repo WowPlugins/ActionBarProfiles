@@ -319,6 +319,76 @@ local function ABP_ApplyBindings(saved)
     return applied, conflicts
 end
 
+-- 能安全交给 SetBinding 的命令：只允许大写字母/数字/下划线/点；
+-- CLICK 类条目要用 SetBindingClick，直接 SetBinding 会破坏鼠标键，一律跳过。
+local function ABP_IsUsableBindingCommand(command)
+    if not command or command == "" then return false end
+    if string.find(command, "^CLICK") then return false end
+    return string.find(command, "^[%u%d_%.]+$") ~= nil
+end
+
+-- 读取当前"动作条之外"的按键绑定：{ [command] = { key1, key2 } }
+-- 移动、界面、聊天、交互等所有非动作条按钮的键位都在这里。
+-- 1.12 没有枚举接口，返回 nil（此时只保存动作条按键）。
+local function ABP_CollectOtherBindings()
+    if not GetNumBindings or not GetBinding then return nil end
+    local result = {}
+    local count = GetNumBindings() or 0
+    for i = 1, count do
+        local command, key1, key2 = GetBinding(i)
+        if key1 and ABP_IsUsableBindingCommand(command) and not ABP_IsActionBarBinding(command) then
+            result[command] = { key1, key2 }
+        end
+    end
+    return result
+end
+
+-- 先解绑存档里"其它按键"命令当前的键（不设新键），让动作条恢复不被这些旧键挡住
+local function ABP_UnbindOtherBindings(saved)
+    if not saved or not SetBinding or not GetBindingKey then return end
+    for command in pairs(saved) do
+        if ABP_IsUsableBindingCommand(command) and not ABP_IsActionBarBinding(command) then
+            local key1, key2 = GetBindingKey(command)
+            if key1 then SetBinding(key1, nil) end
+            if key2 then SetBinding(key2, nil) end
+        end
+    end
+end
+
+-- 恢复"动作条之外"的按键绑定；与动作条键位冲突的键跳过，保证动作条优先。
+-- 返回 恢复数量, 冲突说明列表
+local function ABP_ApplyOtherBindings(saved)
+    if not saved or not SetBinding then return 0, {} end
+
+    ABP_UnbindOtherBindings(saved)
+
+    local applied = 0
+    local conflicts = {}
+    for command, keys in pairs(saved) do
+        if ABP_IsUsableBindingCommand(command) and not ABP_IsActionBarBinding(command) then
+            for k = 1, 2 do
+                local key = keys[k]
+                if key and key ~= "" then
+                    local existing = GetBindingAction and GetBindingAction(key) or nil
+                    if existing and existing ~= "" and existing ~= command
+                       and ABP_IsActionBarBinding(existing) then
+                        conflicts[#conflicts + 1] = key .. " 已绑定动作条按钮，未覆盖"
+                    else
+                        SetBinding(key, command)
+                        applied = applied + 1
+                    end
+                end
+            end
+        end
+    end
+
+    if SaveBindings then
+        local set = GetCurrentBindingSet and GetCurrentBindingSet() or 1
+        SaveBindings(set)
+    end
+    return applied, conflicts
+end
+
 -- ===== 保存任务 =====
 -- 一帧之内对几十个槽位做 SetAction（生成 Tooltip）+ PickupAction/PlaceAction 会造成明显卡顿，
 -- 所以保存拆到多帧执行；而且只有真的发生变化的动作条才会走到这里（见上面的触发源）。
@@ -593,10 +663,16 @@ function ABP_RunSaveJob()
 
     -- 按键绑定跟动作条一起存：绑定的是按钮，不是槽位内容
     job.dest.bindings = ABP_CollectBindings()
+    -- 动作条之外的按键（移动、界面、聊天、交互等）也一起存
+    job.dest.otherBindings = ABP_CollectOtherBindings()
 
     ABP_Layout[ABP_PlayerName][job.name] = job.dest
     if not job.silent then
-        ABP_Msg('配置文件 "' .. job.name .. '" 已保存.')
+        local nBar, nOther = 0, 0
+        for _ in pairs(job.dest.bindings) do nBar = nBar + 1 end
+        for _ in pairs(job.dest.otherBindings or {}) do nOther = nOther + 1 end
+        ABP_Msg('配置文件 "' .. job.name .. '" 已保存（动作条按键 ' .. nBar
+            .. " 个，其它按键 " .. nOther .. " 个）.")
     end
 end
 
@@ -873,19 +949,34 @@ function ABP_LoadProfile(profileName)
     end
     SetCVar("autoSelfCast", scStatus)
 
-    -- 按键绑定：完整覆盖存档里的动作条键位；老存档没有 bindings 字段时不动当前键位
+    -- 按键绑定：完整覆盖存档里的键位；老存档没有对应字段时不动当前键位
+    -- 先让"其它按键"释放当前键位，动作条恢复才不会被它们挡住
+    if profile.otherBindings then
+        ABP_UnbindOtherBindings(profile.otherBindings)
+    end
     local bindingCount, bindingConflicts = nil, nil
     if profile.bindings then
         bindingCount, bindingConflicts = ABP_ApplyBindings(profile.bindings)
     end
+    local otherCount, otherConflicts = nil, nil
+    if profile.otherBindings then
+        otherCount, otherConflicts = ABP_ApplyOtherBindings(profile.otherBindings)
+    end
+    if otherConflicts and #otherConflicts > 0 then
+        bindingConflicts = bindingConflicts or {}
+        for _, c in ipairs(otherConflicts) do
+            bindingConflicts[#bindingConflicts + 1] = c
+        end
+    end
 
     ABP_Msg('配置文件 "' .. profileName .. '" 已加载：放回 ' .. placedCount .. " 个槽位，清空 "
         .. clearedCount .. " 个。")
-    if bindingCount then
-        ABP_Msg("  按键绑定：恢复 " .. bindingCount .. " 个键位.")
+    if bindingCount or otherCount then
+        ABP_Msg("  按键绑定：动作条 " .. (bindingCount or 0) .. " 个，其它 "
+            .. (otherCount or 0) .. " 个键位.")
     end
     if bindingConflicts and #bindingConflicts > 0 then
-        ABP_Msg("|cffff5555[ABP]|r 有 " .. #bindingConflicts .. " 个键位被其它功能占用，未覆盖：")
+        ABP_Msg("|cffff5555[ABP]|r 有 " .. #bindingConflicts .. " 个键位冲突，未覆盖：")
         for k = 1, #bindingConflicts do
             if k > 3 then
                 ABP_Msg("  …还有 " .. (#bindingConflicts - 3) .. " 个")
@@ -916,7 +1007,7 @@ end
 -- 格式：前缀 "ABP1:" + Base64( 一串 netstring 字段 )
 --   netstring 字段 = "#长度:内容"；长度由数据自己给出，所以宏体里的换行、引号、分隔符都不用转义。
 local ABP_PORTABLE_TAG = "ABP1:"
-local ABP_PORTABLE_VERSION = "2" -- 2：在技能/宏/物品之后追加动作条按键段；仍兼容读取 1
+local ABP_PORTABLE_VERSION = "3" -- 3：在动作条按键段之后追加"其它按键"段；仍兼容读取 1、2
 
 local ABP_B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 local ABP_B64_INDEX = {}
@@ -1060,6 +1151,21 @@ local function ABP_BuildPortablePayload(name, profile)
         add(command); add(keys[1] or ""); add(keys[2] or "")
     end
 
+    -- 其它按键段：动作条之外的绑定（移动、界面、聊天、交互等）
+    local others = {}
+    local otherBindings = profile.otherBindings or {}
+    for command in pairs(otherBindings) do
+        if ABP_IsUsableBindingCommand(command) and not ABP_IsActionBarBinding(command) then
+            others[#others + 1] = command
+        end
+    end
+    table.sort(others)
+    add(#others)
+    for _, command in ipairs(others) do
+        local keys = otherBindings[command]
+        add(command); add(keys[1] or ""); add(keys[2] or "")
+    end
+
     return ABP_PackFields(fields)
 end
 
@@ -1089,7 +1195,9 @@ local function ABP_ParsePortable(text)
     end
 
     local version = take()
-    if version ~= "1" and version ~= "2" then return nil, "不支持的便携字符串版本" end
+    if version ~= "1" and version ~= "2" and version ~= "3" then
+        return nil, "不支持的便携字符串版本"
+    end
 
     local name = take()
     if not name or name == "" then return nil, "配置名为空" end
@@ -1147,7 +1255,7 @@ local function ABP_ParsePortable(text)
     end
 
     -- 版本 2 才带按键段；版本 1 没有这段，导入后不会改动当前按键绑定
-    if version == "2" then
+    if version == "2" or version == "3" then
         n = takeNum()
         if not n or n < 0 or n > 1000 then return nil, "按键段数量异常" end
         profile.bindings = {}
@@ -1159,6 +1267,26 @@ local function ABP_ParsePortable(text)
             -- 只接受动作条按钮命令，避免导入字符串把任意命令绑到键上
             if ABP_IsActionBarBinding(command) then
                 profile.bindings[command] = {
+                    (key1 ~= "" and key1 or nil),
+                    (key2 ~= "" and key2 or nil),
+                }
+            end
+        end
+    end
+
+    -- 版本 3 才带"其它按键"段：动作条之外的绑定
+    if version == "3" then
+        n = takeNum()
+        if not n or n < 0 or n > 1000 then return nil, "其它按键段数量异常" end
+        profile.otherBindings = {}
+        for _ = 1, n do
+            local command = takeText()
+            local key1 = takeText()
+            local key2 = takeText()
+            if command == "" then return nil, "其它按键段数据不完整" end
+            -- 命令格式受限（大写字母/数字/下划线/点）且不允许 CLICK 类，避免异常绑定
+            if ABP_IsUsableBindingCommand(command) and not ABP_IsActionBarBinding(command) then
+                profile.otherBindings[command] = {
                     (key1 ~= "" and key1 or nil),
                     (key2 ~= "" and key2 or nil),
                 }
@@ -1192,6 +1320,7 @@ local function ABP_StoreImportedProfile(profile)
         items = profile.items or {},
         macroBodies = profile.macroBodies or {},
         bindings = profile.bindings,
+        otherBindings = profile.otherBindings,
     }
     return true
 end
@@ -1223,6 +1352,9 @@ function ABP_ImportFromString(text)
         .. " 个，物品 " .. ABP_CountEntries(profile.items) .. " 个"
     if profile.bindings then
         importedMsg = importedMsg .. "，按键 " .. ABP_CountEntries(profile.bindings) .. " 个"
+    end
+    if profile.otherBindings then
+        importedMsg = importedMsg .. "，其它按键 " .. ABP_CountEntries(profile.otherBindings) .. " 个"
     end
     ABP_Msg(importedMsg .. ".")
     if skipped and skipped > 0 then
