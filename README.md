@@ -12,7 +12,7 @@
 - **多角色隔离**：配置按"角色名 of 服务器名"隔离，互不干扰；同一角色可保存多套配置。
 - **便携字符串（可跨角色/账号）**：`/abprofile 导出 <名字>` 生成一段 `ABP1:` 开头的字符串，在别的角色/账号用 `/abprofile 导入` 粘贴即可得到同一份配置。字符串是 Base64 + 长度前缀的**纯数据**（不 `loadstring`、不执行任何代码），损坏或截断会被拒绝。
 - **宏重建**：导出时把宏体、图标、是否角色宏一起带走；加载/导入时先按**宏名**找，找不到再按**宏体**去重（已有同宏体的宏直接复用，不改名、不删除），最后才在有空位时新建。
-- **按键绑定一起保存 / 导出**：保存配置时同时记录动作条按钮的按键（主键 + 副键）和动作条之外的按键（移动、聊天、界面、交互等所有其它绑定）；加载时完整覆盖这些键位。便携字符串里也带这两段。动作条段只处理 `ACTIONBUTTON`、`MULTIACTIONBAR*BUTTON`、`BONUSACTIONBUTTON`，其它键位统一走"其它按键"段；`CLICK` 类鼠标绑定不处理。1.12 没有绑定枚举接口，只能保存动作条按键。
+- **按键绑定一起保存 / 导出**：保存配置时同时记录动作条按钮的按键（主键 + 副键）和动作条之外的按键（移动、聊天、界面、交互等所有其它绑定）；加载时完整覆盖这些键位。便携字符串里也带这两段。动作条段处理 `ACTIONBUTTON`、`MULTIACTIONBAR*BUTTON`、`BONUSACTIONBUTTON`、`SHAPESHIFTBUTTON`，以及 Bartender4 / Dominos / ElvUI 这些插件用 `CLICK <按钮>:<鼠标键>` 形式绑定的动作条按钮（恢复时自动改用 `SetBindingClick`）；其它键位统一走"其它按键"段，框体、团队框架等非动作条 `CLICK` 绑定不处理。1.12 没有绑定枚举接口，只能保存动作条按键。
 - **双版本**：同一份代码跑 3.3.5 与 1.12——自动探测客户端；3.3.5 只遍历 1~120 玩家动作槽（121 以上是宠物/载具条，已排除），1.12 仍是 1~144。
 - **战斗中自动延后**：3.3.5 的战斗锁定会拒绝改动作条数组，此时点"加载"不会失败——插件先记下配置，脱战后自动补做。
 - **操作二次确认**：删除布局、加载配置（会完全覆盖当前动作条和按键绑定）、覆盖保存已有布局前都会先弹确认框，确认后才真正执行；新配置直接保存，不打扰。
@@ -145,14 +145,14 @@ ABP_ButtonPosition = <number>   -- 小地图按钮角度（0~360）
    - `bagItemToLoc`：物品名 → 背包/格位（只在装备位找不到的才继续查背包）
 4. 按槽位顺序回填（遍历 1~120 / 1~144）：技能 `PickupSpell` → `PlaceAction`；宏优先 `PickupMacro(0, name)`（超级宏），否则 `ABP_EnsureMacro`（按宏名 → 按宏体去重 → 新建）后 `PickupMacro(idx)`；物品先查装备位再查背包。**存档中为空的槽位会被清空**，实现完全覆盖。
 5. 回填期间同样临时关闭 `autoSelfCast`
-6. **按键绑定**：先让配置里的 `otherBindings` 命令释放当前键位，再按 `bindings` 完整覆盖动作条键位（先清空当前所有动作条键，再逐条 `SetBinding`），最后恢复 `otherBindings` 并 `SaveBindings` 落盘。动作条永远优先：两边抢同一个键时"其它按键"跳过并报告冲突；存档里没有的动作条旧键位不会残留。老存档没有对应字段时不碰当前按键。
+6. **按键绑定**：先让配置里的 `otherBindings` 命令释放当前键位，再按 `bindings` 完整覆盖动作条键位（先清空当前所有动作条键，再逐条设置：普通命令用 `SetBinding`，Bartender4 / Dominos / ElvUI 的 `CLICK <按钮>:<鼠标键>` 用 `SetBindingClick`），最后恢复 `otherBindings` 并 `SaveBindings` 落盘。动作条永远优先：两边抢同一个键时"其它按键"跳过并报告冲突；存档里没有的动作条旧键位不会残留。老存档没有对应字段时不碰当前按键。
 7. 报告放回 / 清空数量、恢复的两类键位数与"没能恢复"清单（含原因），并安排 **3 秒后的自检**（`ABP_StartVerifyJob` → `ABP_ReportVerify`）
 
 ### 便携字符串 `ABP_BuildPortableString` / `ABP_ImportFromString`
 
 - **导出**：`ABP1:` + Base64( 一串长度前缀字段 )。字段依次是版本号（当前为 `3`）、配置名，然后是技能 / 宏 / 物品 / 动作条按键 / 其它按键五段（每段先给数量，再按槽号或命令名升序逐条给字段）；宏段额外带宏体、图标贴图、是否角色宏，两段按键都带命令名、主键、副键。
 - **导入**：校验前缀 → Base64 解码 → 逐字段校验（netstring 长度、各段数量、槽号范围）→ 只写入 `ABP_Layout`，**不立刻改动作条或按键**；槽号超出本客户端上限（3.3.5 为 120）的条目会被丢弃并计数。同名配置会弹窗确认覆盖。版本 `1` 的老字符串仍可导入（不带按键），版本 `2` 可导入（只带动作条按键）。
-- **安全**：全程不使用 `loadstring`，字符串只被当作纯数据解析；动作条按键段只接受 `ACTIONBUTTON`、`MULTIACTIONBAR*BUTTON`、`BONUSACTIONBUTTON` 三类命令，其它按键段只接受"大写字母/数字/下划线/点"组成的命令且拒绝 `CLICK` 类；损坏、截断、版本不符都只报错，不会执行任何代码。
+- **安全**：全程不使用 `loadstring`，字符串只被当作纯数据解析；动作条按键段只接受 `ACTIONBUTTON`、`MULTIACTIONBAR*BUTTON`、`BONUSACTIONBUTTON`、`SHAPESHIFTBUTTON` 命令，以及 `CLICK BT4Button*/BT4PetButton*/BT4StanceButton*/DominosActionButton*/ElvUI_Bar*Button*` 这几种动作条按钮的点击绑定，其它按键段只接受"大写字母/数字/下划线/点"组成的命令且拒绝 `CLICK` 类；损坏、截断、版本不符都只报错，不会执行任何代码。
 
 ## 函数清单
 
@@ -197,7 +197,8 @@ ABP_ButtonPosition = <number>   -- 小地图按钮角度（0~360）
 | `ABP_GetMacroIconIndex` / `ABP_ReadMacroInfo` | 图标贴图 → 图标序号（懒加载映射）/ 读取宏体、图标、是否角色宏 |
 | `ABP_FindMacroIndexByName` / `ABP_FindMacroIndexByBody` | 按宏名找宏序号 / 按宏体找宏序号（去重） |
 | `ABP_EnsureMacro` | 宏重建：按名 → 按宏体 → 有空位才 `CreateMacro`；失败返回 nil + 原因 |
-| `ABP_IsActionBarBinding` / `ABP_CollectBindings` | 判断是否动作条绑定命令 / 读取当前动作条按键（命令 → 主键、副键） |
+| `ABP_IsActionBarBinding` / `ABP_CollectBindings` | 判断是否动作条绑定（含动作条插件的 `CLICK` 形式）/ 读取当前动作条按键（命令 → 主键、副键） |
+| `ABP_ParseActionBarClickBinding` / `ABP_SetBindingCommand` | 解析 `CLICK <按钮>:<鼠标键>`（只认动作条按钮）/ 按命令类型选用 `SetBinding` 或 `SetBindingClick` |
 | `ABP_ApplyBindings` | 完整覆盖恢复动作条键位：先清空再设置，冲突时跳过并返回说明 |
 | `ABP_IsUsableBindingCommand` | 判断命令能否安全交给 `SetBinding`（大写字母/数字/下划线/点，且非 `CLICK` 类） |
 | `ABP_CollectOtherBindings` / `ABP_ApplyOtherBindings` / `ABP_UnbindOtherBindings` | 读取动作条之外的按键 / 恢复它们 / 先解绑这些命令的旧键（给动作条让路） |
@@ -236,7 +237,7 @@ ABP_ButtonPosition = <number>   -- 小地图按钮角度（0~360）
 5. **性能**：保存/自检都是分帧任务（每帧 3~6 个槽位）；3.3.5 判类型不动光标，比 1.12 更轻。插件不注册任何动作条/退出事件，不挂钩 `PlaceAction`/`Logout`/`Quit`，平时完全不做事（计时帧每帧只做一次极轻量的判断）。
 6. **安全序列化（无 `loadstring`）**：便携字符串是 `ABP1:` + 标准 Base64 + netstring（`#长度:内容`）字段流。解析只做字符串切分与数字校验，从不把输入当代码执行；前缀不符、Base64 非法、长度不足、段数量不符、版本不符都会被明确拒绝。宏体里的中文、换行、`|`、`;`、`#`、`\`、引号都因长度前缀而无需转义。
 7. **宏重建的边界**：导出时把宏体、图标贴图、是否角色宏一起写入 `macroBodies`（老存档没有这段数据时，导出会现场读取本机同名宏）。加载/导入时按**宏名 → 宏体 → 新建**的顺序查找，已有同宏体的宏直接复用、不改名也不删除；只有宏位不足时才放弃并在"没能恢复"清单里写"没有空余的宏位"。不再像旧实现那样改名后重复建宏。
-8. **按键绑定的范围与冲突**：绑定记录的是动作条按钮命令（`ACTIONBUTTON1~12`、`MULTIACTIONBAR*BUTTON*`、`BONUSACTIONBUTTON*`），不是动作槽号，所以主条翻页时同一组键位仍然有效。动作条之外的绑定单独存在 `otherBindings`（移动、聊天、界面、交互等），加载时先解绑这些命令的当前键位，再恢复动作条键位，最后恢复其它键位；两边抢同一个键时动作条优先，其它按键跳过并报告冲突。`CLICK` 类鼠标绑定不采集也不恢复。老配置没有对应字段时完全不碰当前按键。
+8. **按键绑定的范围与冲突**：绑定记录的是动作条按钮命令（`ACTIONBUTTON1~12`、`MULTIACTIONBAR*BUTTON*`、`BONUSACTIONBUTTON*`、`SHAPESHIFTBUTTON*`），不是动作槽号，所以主条翻页时同一组键位仍然有效。使用 Bartender4 / Dominos / ElvUI 时，除主条前 12 个按钮外，其余按钮的键位是 `CLICK <按钮名>:<鼠标键>` 形式；插件能识别这些动作条按钮并用 `SetBindingClick` 恢复（只认 `BT4Button*`、`BT4PetButton*`、`BT4StanceButton*`、`DominosActionButton*`、`ElvUI_Bar*Button*`，框体/团队框架等其它 `CLICK` 一律不碰）。动作条之外的普通绑定单独存在 `otherBindings`（移动、聊天、界面、交互等），加载时先解绑这些命令的当前键位，再恢复动作条键位，最后恢复其它键位；两边抢同一个键时动作条优先，其它按键跳过并报告冲突。老配置没有对应字段时完全不碰当前按键。
 9. **不包含动作条外观布局**：按钮位置、数量、分页、缩放属于动作条插件（Bartender4、Dominos 等）自己的数据，本插件不读取也不还原，只保存按钮上的动作和按键。
 
 ## 多版本支持（3.3.5 / 1.12）

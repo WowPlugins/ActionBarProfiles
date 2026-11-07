@@ -233,14 +233,38 @@ local ABP_BINDING_PATTERNS = {
     "^ACTIONBUTTON%d+$",
     "^MULTIACTIONBAR%d+BUTTON%d+$",
     "^BONUSACTIONBUTTON%d+$",
+    "^SHAPESHIFTBUTTON%d+$",
 }
+
+-- 第三方动作条插件（Bartender4 / Dominos / ElvUI）的按钮名。
+-- 它们的按键不是命令式绑定，而是 "CLICK <按钮名>:<鼠标键>" 形式，恢复要用 SetBindingClick。
+local ABP_ACTIONBAR_CLICK_BUTTON_PATTERNS = {
+    "^BT4Button%d+$",
+    "^BT4PetButton%d+$",
+    "^BT4StanceButton%d+$",
+    "^DominosActionButton%d+$",
+    "^ElvUI_Bar%d+Button%d+$",
+}
+
+-- 解析 "CLICK <按钮名>:<鼠标键>"；只认动作条按钮，其它 CLICK（框体、团队框架等）一律返回 nil
+local function ABP_ParseActionBarClickBinding(command)
+    if type(command) ~= "string" then return nil end
+    local button, mouse = string.match(command, "^CLICK%s+([%w_]+):([%w]+)$")
+    if not button or not mouse then return nil end
+    for k = 1, #ABP_ACTIONBAR_CLICK_BUTTON_PATTERNS do
+        if string.find(button, ABP_ACTIONBAR_CLICK_BUTTON_PATTERNS[k]) then
+            return button, mouse
+        end
+    end
+    return nil
+end
 
 local function ABP_IsActionBarBinding(command)
     if not command or command == "" then return false end
     for k = 1, #ABP_BINDING_PATTERNS do
         if string.find(command, ABP_BINDING_PATTERNS[k]) then return true end
     end
-    return false
+    return ABP_ParseActionBarClickBinding(command) ~= nil
 end
 
 -- 读取当前动作条按键绑定：返回 { [command] = { key1, key2 } }
@@ -277,6 +301,20 @@ local function ABP_CollectBindings()
     return result
 end
 
+-- 把某个键绑到存档里的命令：普通命令用 SetBinding，动作条插件的按钮用 SetBindingClick
+local function ABP_SetBindingCommand(key, command)
+    if not key or not command or command == "" then return false end
+    local button, mouse = ABP_ParseActionBarClickBinding(command)
+    if button then
+        if not SetBindingClick then return false end
+        SetBindingClick(key, button, mouse)
+        return true
+    end
+    if not SetBinding then return false end
+    SetBinding(key, command)
+    return true
+end
+
 -- 用存档里的键位完整覆盖当前动作条按键：
 --   1) 先清掉当前所有动作条命令的键位（存档里没记录的旧键位不会残留）；
 --   2) 再逐条设置存档里的键；
@@ -304,8 +342,9 @@ local function ABP_ApplyBindings(saved)
                        and not ABP_IsActionBarBinding(existing) then
                         conflicts[#conflicts + 1] = key .. " 已被 " .. existing .. " 占用，未覆盖"
                     else
-                        SetBinding(key, command)
-                        applied = applied + 1
+                        if ABP_SetBindingCommand(key, command) then
+                            applied = applied + 1
+                        end
                     end
                 end
             end
