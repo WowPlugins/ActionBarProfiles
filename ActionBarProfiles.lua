@@ -1298,6 +1298,68 @@ function ABP_RemoveProfile(profileName)
     ABP_Msg("配置文件 '" .. profileName .. "' 已经删除.")
 end
 
+-- ===== 二次确认 =====
+-- 覆盖保存 / 加载覆盖当前动作条 / 删除这类操作先弹确认框，确认后才真正执行。
+-- 菜单、斜杠命令都走下面的 Request 入口；ABP_SaveProfile / ABP_LoadProfile / ABP_RemoveProfile
+-- 仍是"真正执行"的函数，确认弹窗里的回调才会调用它们。
+local ABP_PendingConfirm = nil
+
+local function ABP_ConfirmAction(popupName, arg, action)
+    ABP_PendingConfirm = action
+    StaticPopup_Show(popupName, arg)
+end
+
+local function ABP_DoPendingConfirm()
+    local action = ABP_PendingConfirm
+    ABP_PendingConfirm = nil
+    if action then action() end
+end
+
+local function ABP_CancelPendingConfirm()
+    ABP_PendingConfirm = nil
+end
+
+-- 保存：配置名已存在时才确认是否覆盖；新配置直接保存
+function ABP_RequestSave(profileName)
+    if not profileName or profileName == "" then
+        ABP_Msg("请先输入配置名.")
+        return
+    end
+    local existing = ABP_PlayerName and ABP_Layout and ABP_Layout[ABP_PlayerName]
+        and ABP_Layout[ABP_PlayerName][profileName]
+    if not existing then
+        ABP_SaveProfile(profileName)
+        return
+    end
+    ABP_ConfirmAction("ABP_ConfirmSave", profileName, function()
+        ABP_SaveProfile(profileName)
+    end)
+end
+
+-- 加载：会完全覆盖当前动作条与按键绑定，先确认
+function ABP_RequestLoad(profileName)
+    if not ABP_PlayerName or not ABP_Layout or not ABP_Layout[ABP_PlayerName]
+       or not ABP_Layout[ABP_PlayerName][profileName] then
+        ABP_Msg('配置文件 "' .. tostring(profileName) .. '" 以前没有保存，无法加载.')
+        return
+    end
+    ABP_ConfirmAction("ABP_ConfirmLoad", profileName, function()
+        ABP_LoadProfile(profileName)
+    end)
+end
+
+-- 删除：不可撤销，先确认
+function ABP_RequestRemove(profileName)
+    if not ABP_PlayerName or not ABP_Layout or not ABP_Layout[ABP_PlayerName]
+       or not ABP_Layout[ABP_PlayerName][profileName] then
+        ABP_Msg("你没有配置文件 '" .. tostring(profileName) .. "' 保存在这个人物上.")
+        return
+    end
+    ABP_ConfirmAction("ABP_ConfirmRemove", profileName, function()
+        ABP_RemoveProfile(profileName)
+    end)
+end
+
 
 
 -- 由独立计时帧每帧驱动：推进进行中的任务（保存任务 / 加载后的自检）
@@ -1429,15 +1491,15 @@ function ABP_SlashCommand(msg)
     end
 
     for profileName in string.gfind(cmd, CMD_SAVE .. " (.*)") do
-        ABP_SaveProfile(profileName)
+        ABP_RequestSave(profileName)
         return
     end
     for profileName in string.gfind(cmd, CMD_LOAD .. " (.*)") do
-        ABP_LoadProfile(profileName)
+        ABP_RequestLoad(profileName)
         return
     end
     for profileName in string.gfind(cmd, CMD_REMOVE .. " (.*)") do
-        ABP_RemoveProfile(profileName)
+        ABP_RequestRemove(profileName)
         return
     end
     for profileName in string.gfind(cmd, CMD_CHECK .. " (.*)") do
@@ -1483,7 +1545,7 @@ function ABP_DropDownMenu_OnLoad(menu)
                 UIDropDownMenu_AddButton({
                     text = pname,
                     value = pname,
-                    func = function() ABP_RemoveProfile(pname) end,
+                    func = function() ABP_RequestRemove(pname) end,
                     notCheckable = 1,
                     owner = owner,
                 }, UIDROPDOWNMENU_MENU_LEVEL)
@@ -1508,7 +1570,7 @@ function ABP_DropDownMenu_OnLoad(menu)
                 UIDropDownMenu_AddButton({
                     text = pname,
                     value = pname,
-                    func = function() ABP_SaveProfile(pname) end,
+                    func = function() ABP_RequestSave(pname) end,
                     notCheckable = 1,
                     owner = owner,
                 }, UIDROPDOWNMENU_MENU_LEVEL)
@@ -1563,7 +1625,7 @@ function ABP_DropDownMenu_OnLoad(menu)
             local pname = profileName
             UIDropDownMenu_AddButton({
                 text = pname,
-                func = function() ABP_LoadProfile(pname) end,
+                func = function() ABP_RequestLoad(pname) end,
                 notCheckable = 1,
                 owner = owner,
             }, UIDROPDOWNMENU_MENU_LEVEL)
@@ -1648,14 +1710,14 @@ StaticPopupDialogs["ABP_NewProfile"] = {
         local box = ABP_GetPopupEditBox(self)
         if not box then return end
         local profileName = box:GetText()
-        ABP_SaveProfile(profileName)
+        ABP_RequestSave(profileName)
         box:SetText("")
     end,
     EditBoxOnEnterPressed = function(self)
         local box = self or this
         if not box then return end
         local profileName = box:GetText()
-        ABP_SaveProfile(profileName)
+        ABP_RequestSave(profileName)
         box:SetText("")
         local popup = box:GetParent()
         if popup then popup:Hide() end
@@ -1669,7 +1731,7 @@ StaticPopupDialogs["ABP_NewProfile"] = {
 
 -- 导入时配置名已存在的覆盖确认
 StaticPopupDialogs["ABP_ImportOverwrite"] = {
-    text = '配置 "%1" 已存在，要用导入的内容覆盖吗？',
+    text = '配置 "%s" 已存在，要用导入的内容覆盖吗？',
     button1 = YES,
     button2 = NO,
     OnAccept = function()
@@ -1684,6 +1746,45 @@ StaticPopupDialogs["ABP_ImportOverwrite"] = {
         ABP_PendingImport = nil
         ABP_Msg("已取消导入.")
     end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+    preferredIndex = 3,
+}
+
+-- 覆盖保存确认
+StaticPopupDialogs["ABP_ConfirmSave"] = {
+    text = '布局 "%s" 已存在，要用当前动作条覆盖保存吗？',
+    button1 = YES,
+    button2 = NO,
+    OnAccept = function() ABP_DoPendingConfirm() end,
+    OnCancel = function() ABP_CancelPendingConfirm() end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+    preferredIndex = 3,
+}
+
+-- 加载覆盖确认
+StaticPopupDialogs["ABP_ConfirmLoad"] = {
+    text = '加载 "%s" 会完全覆盖当前动作条和按键绑定，确定继续吗？',
+    button1 = YES,
+    button2 = NO,
+    OnAccept = function() ABP_DoPendingConfirm() end,
+    OnCancel = function() ABP_CancelPendingConfirm() end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+    preferredIndex = 3,
+}
+
+-- 删除确认
+StaticPopupDialogs["ABP_ConfirmRemove"] = {
+    text = '确定要删除布局 "%s" 吗？此操作无法撤销。',
+    button1 = YES,
+    button2 = NO,
+    OnAccept = function() ABP_DoPendingConfirm() end,
+    OnCancel = function() ABP_CancelPendingConfirm() end,
     timeout = 0,
     whileDead = true,
     hideOnEscape = true,
