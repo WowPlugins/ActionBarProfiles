@@ -318,8 +318,8 @@ end
 -- 用存档里的键位完整覆盖当前动作条按键：
 --   1) 先清掉当前所有动作条命令的键位（存档里没记录的旧键位不会残留）；
 --   2) 再逐条设置存档里的键；
---   3) 若某个键当前被非动作条命令占用，则跳过并记录冲突，避免误伤其它按键。
--- 返回 恢复的键位数量, 冲突说明列表
+--   3) 键位被其它命令占用时也以存档为准强制改绑（例如 ACTIONPAGE1），只记录改了什么。
+-- 返回 恢复的键位数量, 被改绑的旧命令说明列表
 local function ABP_ApplyBindings(saved)
     if not saved or not SetBinding then return 0, {} end
 
@@ -331,7 +331,7 @@ local function ABP_ApplyBindings(saved)
     end
 
     local applied = 0
-    local conflicts = {}
+    local overridden = {}
     for command, keys in pairs(saved) do
         if ABP_IsActionBarBinding(command) then
             for k = 1, 2 do
@@ -340,11 +340,10 @@ local function ABP_ApplyBindings(saved)
                     local existing = GetBindingAction and GetBindingAction(key) or nil
                     if existing and existing ~= "" and existing ~= command
                        and not ABP_IsActionBarBinding(existing) then
-                        conflicts[#conflicts + 1] = key .. " 已被 " .. existing .. " 占用，未覆盖"
-                    else
-                        if ABP_SetBindingCommand(key, command) then
-                            applied = applied + 1
-                        end
+                        overridden[#overridden + 1] = key .. " 已从 " .. existing .. " 改绑到本配置"
+                    end
+                    if ABP_SetBindingCommand(key, command) then
+                        applied = applied + 1
                     end
                 end
             end
@@ -355,7 +354,7 @@ local function ABP_ApplyBindings(saved)
         local set = GetCurrentBindingSet and GetCurrentBindingSet() or 1
         SaveBindings(set)
     end
-    return applied, conflicts
+    return applied, overridden
 end
 
 -- 能安全交给 SetBinding 的命令：只允许大写字母/数字/下划线/点；
@@ -838,6 +837,48 @@ local function ABP_FindItemsInBags(neededItems)
     return bagMap
 end
 
+-- 在"宠物与坐骑"收藏里按名字找坐骑/宠物（3.3.5 起可用）。
+-- 已学会的坐骑/宠物不在背包里，只能从收藏里恢复。返回 kind, index
+local function ABP_FindCompanionByName(name)
+    if not name or name == "" or not GetNumCompanions or not GetCompanionInfo then
+        return nil
+    end
+    local spellID
+    if GetItemSpell then
+        local _, sid = GetItemSpell(name)
+        spellID = sid
+    end
+    local kinds = { "MOUNT", "CRITTER" }
+    for k = 1, #kinds do
+        local kind = kinds[k]
+        for i = 1, (GetNumCompanions(kind) or 0) do
+            local _, cname, cspell = GetCompanionInfo(kind, i)
+            if cname == name or (spellID and cspell == spellID) then
+                return kind, i
+            end
+        end
+    end
+    -- 兜底：客户端已经不认识这个物品名（服务端改名 / 物品被移除），而收藏里只有一个坐骑时，
+    -- 只能认为动作条上那匹失效的坐骑就是它
+    if (not GetItemInfo or not GetItemInfo(name)) and (GetNumCompanions("MOUNT") or 0) == 1 then
+        return "MOUNT", 1
+    end
+    return nil
+end
+
+-- 坐骑/宠物恢复后槽位会变成"召唤法术"：同步配置，避免自检把"物品 → 法术"误报成不一致
+local function ABP_SyncRestoredSlot(profile, i)
+    if not profile or not ABP_IS_MODERN or not HasAction(i) then return end
+    if GetActionInfo(i) ~= "spell" then return end
+    ABP_Tooltip:ClearLines()
+    ABP_Tooltip:SetAction(i)
+    local name, rank = ABP_GetTooltipLine1()
+    if not name or name == "" then return end
+    profile.items[i] = nil
+    if not profile.spells then profile.spells = {} end
+    profile.spells[i] = { name = name, rank = rank }
+end
+
 -- 加载配置到动作条（完全覆盖当前布局）
 -- 先预构建技能/物品映射表，再按槽位回填；配置中为空的槽位会被清空
 -- 3.3.5 上拾取/放置类 API 受战斗限制，战斗中调用会被拒绝：这里改为"记下来，脱战后自动补做"
@@ -913,8 +954,19 @@ function ABP_LoadProfile(profileName)
                     -- 法术书里找不到，但这个槽位现在挂着的就是它（比如物品给的技能）：算它已经到位
                     placedCount = placedCount + 1
                 else
+                    -- 坐骑/宠物法术不在法术书里，改从"宠物与坐骑"收藏里恢复
+                    local ckind, cindex = ABP_FindCompanionByName(sp.name)
+                    if ckind then
+                        PickupCompanion(ckind, cindex)
+                        PlaceAction(i)
+                        ClearCursor()
+                        if HasAction(i) then
+                            placedCount = placedCount + 1
+                            break
+                        end
+                    end
                     table.insert(missed, "技能 槽" .. i .. " " .. tostring(sp.name)
-                        .. (sp.rank and (" " .. sp.rank) or "") .. "（法术书里找不到）")
+                        .. (sp.rank and (" " .. sp.rank) or "") .. "（法术书、宠物/坐骑里都找不到）")
                 end
                 break
             end
@@ -976,7 +1028,19 @@ function ABP_LoadProfile(profileName)
                     placedCount = placedCount + 1
                     break
                 end
-                table.insert(missed, "物品 槽" .. i .. " " .. iname .. "（背包和装备上都没有）")
+                -- 可能是已学会的坐骑/宠物：物品已经不在背包，改从"宠物与坐骑"收藏里恢复
+                local ckind, cindex = ABP_FindCompanionByName(iname)
+                if ckind then
+                    PickupCompanion(ckind, cindex)
+                    PlaceAction(i)
+                    ClearCursor() -- 清空光标残留
+                    if HasAction(i) then
+                        placedCount = placedCount + 1
+                        ABP_SyncRestoredSlot(profile, i)
+                        break
+                    end
+                end
+                table.insert(missed, "物品 槽" .. i .. " " .. iname .. "（背包、装备和宠物/坐骑里都没有）")
                 break
             end
 
@@ -993,19 +1057,13 @@ function ABP_LoadProfile(profileName)
     if profile.otherBindings then
         ABP_UnbindOtherBindings(profile.otherBindings)
     end
-    local bindingCount, bindingConflicts = nil, nil
+    local bindingCount, bindingOverridden = nil, nil
     if profile.bindings then
-        bindingCount, bindingConflicts = ABP_ApplyBindings(profile.bindings)
+        bindingCount, bindingOverridden = ABP_ApplyBindings(profile.bindings)
     end
     local otherCount, otherConflicts = nil, nil
     if profile.otherBindings then
         otherCount, otherConflicts = ABP_ApplyOtherBindings(profile.otherBindings)
-    end
-    if otherConflicts and #otherConflicts > 0 then
-        bindingConflicts = bindingConflicts or {}
-        for _, c in ipairs(otherConflicts) do
-            bindingConflicts[#bindingConflicts + 1] = c
-        end
     end
 
     ABP_Msg('配置文件 "' .. profileName .. '" 已加载：放回 ' .. placedCount .. " 个槽位，清空 "
@@ -1014,14 +1072,24 @@ function ABP_LoadProfile(profileName)
         ABP_Msg("  按键绑定：动作条 " .. (bindingCount or 0) .. " 个，其它 "
             .. (otherCount or 0) .. " 个键位.")
     end
-    if bindingConflicts and #bindingConflicts > 0 then
-        ABP_Msg("|cffff5555[ABP]|r 有 " .. #bindingConflicts .. " 个键位冲突，未覆盖：")
-        for k = 1, #bindingConflicts do
+    if bindingOverridden and #bindingOverridden > 0 then
+        ABP_Msg("  已按存档改绑 " .. #bindingOverridden .. " 个被占用的键位：")
+        for k = 1, #bindingOverridden do
             if k > 3 then
-                ABP_Msg("  …还有 " .. (#bindingConflicts - 3) .. " 个")
+                ABP_Msg("  …还有 " .. (#bindingOverridden - 3) .. " 个")
                 break
             end
-            ABP_Msg("  " .. bindingConflicts[k])
+            ABP_Msg("  " .. bindingOverridden[k])
+        end
+    end
+    if otherConflicts and #otherConflicts > 0 then
+        ABP_Msg("|cffff5555[ABP]|r 有 " .. #otherConflicts .. " 个其它按键因与动作条冲突未覆盖：")
+        for k = 1, #otherConflicts do
+            if k > 3 then
+                ABP_Msg("  …还有 " .. (#otherConflicts - 3) .. " 个")
+                break
+            end
+            ABP_Msg("  " .. otherConflicts[k])
         end
     end
     if table.getn(missed) > 0 then

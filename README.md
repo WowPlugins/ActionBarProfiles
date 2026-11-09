@@ -7,7 +7,7 @@
 
 - **一键保存 / 加载 / 删除 / 列表**：把当前动作条上的**技能、宏、物品**整体存成命名配置（Profile），随时一键恢复。
 - **完全覆盖加载**：加载后动作条与保存时**完全一致**——保存时为空的动作槽位，加载后也会被清空，不会残留当前布局。
-- **加载结果报告**：放回 / 清空了多少槽位；存档里有、这次没能放回去的槽位会逐条列出并给原因（技能不在法术书里、宏不存在、物品不在背包或装备上）。如果该槽位现在挂着的本来就是这个技能 / 宏 / 物品，算"已经在位"，不会误报。
+- **加载结果报告**：放回 / 清空了多少槽位；存档里有、这次没能放回去的槽位会逐条列出并给原因（技能不在法术书里、宏不存在、物品不在背包 / 装备 / 宠物与坐骑收藏里）。如果该槽位现在挂着的本来就是这个技能 / 宏 / 物品，算"已经在位"，不会误报。
 - **加载后 3 秒自检**：等动作条稳定后自动扫一遍，与刚加载的存档逐槽比对，直接报"与存档完全一致"或列出差异（最多 8 条）。也可以随时用 `/abprofile 对比 <名字>` 手动比对。
 - **多角色隔离**：配置按"角色名 of 服务器名"隔离，互不干扰；同一角色可保存多套配置。
 - **便携字符串（可跨角色/账号）**：`/abprofile 导出 <名字>` 生成一段 `ABP1:` 开头的字符串，在别的角色/账号用 `/abprofile 导入` 粘贴即可得到同一份配置。字符串是 Base64 + 长度前缀的**纯数据**（不 `loadstring`、不执行任何代码），损坏或截断会被拒绝。
@@ -143,9 +143,9 @@ ABP_ButtonPosition = <number>   -- 小地图按钮角度（0~360）
    - `spellMap`：由 `ABP_BuildNeededSpellMap` 生成，含 `exact`（技能名+等级 精确键）与 `byName`（只按技能名，仅当存档没记等级时兜底）
    - `equipItemToId`：物品名 → 装备槽位（遍历 1~19 装备位）
    - `bagItemToLoc`：物品名 → 背包/格位（只在装备位找不到的才继续查背包）
-4. 按槽位顺序回填（遍历 1~120 / 1~144）：技能 `PickupSpell` → `PlaceAction`；宏优先 `PickupMacro(0, name)`（超级宏），否则 `ABP_EnsureMacro`（按宏名 → 按宏体去重 → 新建）后 `PickupMacro(idx)`；物品先查装备位再查背包。**存档中为空的槽位会被清空**，实现完全覆盖。
+4. 按槽位顺序回填（遍历 1~120 / 1~144）：技能 `PickupSpell` → `PlaceAction`（法术书里找不到的技能再试"宠物与坐骑"收藏）；宏优先 `PickupMacro(0, name)`（超级宏），否则 `ABP_EnsureMacro`（按宏名 → 按宏体去重 → 新建）后 `PickupMacro(idx)`；物品先查装备位再查背包；背包和装备都找不到时，再按名称（以及物品使用法术的 spellID）到"宠物与坐骑"收藏里找（`GetNumCompanions` / `GetCompanionInfo` → `PickupCompanion` → `PlaceAction`）；如果客户端已经不认这个物品名（服务端改名/移除）而收藏里只有一个坐骑，则按这个唯一坐骑恢复。恢复成功后把该槽位在配置里从 `items` 迁移成 `spells`，避免自检误报。**存档中为空的槽位会被清空**，实现完全覆盖。
 5. 回填期间同样临时关闭 `autoSelfCast`
-6. **按键绑定**：先让配置里的 `otherBindings` 命令释放当前键位，再按 `bindings` 完整覆盖动作条键位（先清空当前所有动作条键，再逐条设置：普通命令用 `SetBinding`，Bartender4 / Dominos / ElvUI 的 `CLICK <按钮>:<鼠标键>` 用 `SetBindingClick`），最后恢复 `otherBindings` 并 `SaveBindings` 落盘。动作条永远优先：两边抢同一个键时"其它按键"跳过并报告冲突；存档里没有的动作条旧键位不会残留。老存档没有对应字段时不碰当前按键。
+6. **按键绑定**：先让配置里的 `otherBindings` 命令释放当前键位，再按 `bindings` 完整覆盖动作条键位（先清空当前所有动作条键，再逐条设置：普通命令用 `SetBinding`，Bartender4 / Dominos / ElvUI 的 `CLICK <按钮>:<鼠标键>` 用 `SetBindingClick`），最后恢复 `otherBindings` 并 `SaveBindings` 落盘。**以存档为准**：动作条键位即使被其它命令占用（例如内置翻页命令 `ACTIONPAGE1`）也会强制改绑，并在提示里列出改了什么；同一存档内动作条与"其它按键"抢同一个键时动作条优先，其它按键跳过；存档里没有的动作条旧键位不会残留。老存档没有对应字段时不碰当前按键。
 7. 报告放回 / 清空数量、恢复的两类键位数与"没能恢复"清单（含原因），并安排 **3 秒后的自检**（`ABP_StartVerifyJob` → `ABP_ReportVerify`）
 
 ### 便携字符串 `ABP_BuildPortableString` / `ABP_ImportFromString`
@@ -194,12 +194,13 @@ ABP_ButtonPosition = <number>   -- 小地图按钮角度（0~360）
 | `ABP_InCombat` / `ABP_QueueLoad` | 战斗状态判断 / 记下被推迟的加载（脱战后补做） |
 | `ABP_GetPopupEditBox` | 兼容取弹窗输入框（1.12 传确定按钮、3.3.5 传弹窗本身） |
 | `ABP_BuildNeededSpellMap` / `ABP_FindItemsInEquipment` / `ABP_FindItemsInBags` | 三张加载用映射表（法术名 exact/byName、装备位、背包） |
+| `ABP_FindCompanionByName` / `ABP_SyncRestoredSlot` | 在"宠物与坐骑"收藏里按名称/物品法术找已学会的坐骑宠物 / 恢复后把配置里的物品记录迁移成法术 |
 | `ABP_GetMacroIconIndex` / `ABP_ReadMacroInfo` | 图标贴图 → 图标序号（懒加载映射）/ 读取宏体、图标、是否角色宏 |
 | `ABP_FindMacroIndexByName` / `ABP_FindMacroIndexByBody` | 按宏名找宏序号 / 按宏体找宏序号（去重） |
 | `ABP_EnsureMacro` | 宏重建：按名 → 按宏体 → 有空位才 `CreateMacro`；失败返回 nil + 原因 |
 | `ABP_IsActionBarBinding` / `ABP_CollectBindings` | 判断是否动作条绑定（含动作条插件的 `CLICK` 形式）/ 读取当前动作条按键（命令 → 主键、副键） |
 | `ABP_ParseActionBarClickBinding` / `ABP_SetBindingCommand` | 解析 `CLICK <按钮>:<鼠标键>`（只认动作条按钮）/ 按命令类型选用 `SetBinding` 或 `SetBindingClick` |
-| `ABP_ApplyBindings` | 完整覆盖恢复动作条键位：先清空再设置，冲突时跳过并返回说明 |
+| `ABP_ApplyBindings` | 完整覆盖恢复动作条键位：先清空再设置，键位被其它命令占用时以存档为准强制改绑，并返回改绑说明 |
 | `ABP_IsUsableBindingCommand` | 判断命令能否安全交给 `SetBinding`（大写字母/数字/下划线/点，且非 `CLICK` 类） |
 | `ABP_CollectOtherBindings` / `ABP_ApplyOtherBindings` / `ABP_UnbindOtherBindings` | 读取动作条之外的按键 / 恢复它们 / 先解绑这些命令的旧键（给动作条让路） |
 | `ABP_Base64Encode` / `ABP_Base64Decode` | 标准 Base64 编解码（用 `math.floor` / `2^bits`，不依赖 bit 库） |
@@ -232,12 +233,12 @@ ABP_ButtonPosition = <number>   -- 小地图按钮角度（0~360）
 3. **宏兼容双路径**：`GetSuperMacroInfo`（超级宏）与 `GetMacroIndexByName`（普通宏）双路回退（超级宏是乌龟服专有，3.3.5 上自动落到普通宏路径）。加载时优先尝试 `PickupMacro(0, name)`，失败才走 `ABP_EnsureMacro` 重建。
 4. **加载的限制**：
    - 技能必须是**法术书里能找到的同一个 技能名（+ 等级）**；洗点、没学过、物品给的技能放不回去（会在"没能恢复"清单里说明）。若存档里没记等级（3.3.5 上 Tooltip 读不到等级时会出现），会退化为"只按技能名"匹配。
-   - 物品必须还在**背包或装备位**上；放银行、卖掉、用完了就恢复不回去。
+   - 物品必须还在**背包或装备位**上，或者该物品是**已学会的坐骑/宠物**（在"宠物与坐骑"收藏里，先按名称、再按物品使用法术的 spellID 匹配；如果客户端已经不认这个物品名而收藏里只有一个坐骑，会按该唯一坐骑恢复）；放银行、卖掉、用完了就恢复不回去。
    - **姿态 / 奖励动作条**：保存的是当时奖励页的内容。3.3.5 的奖励页对应 **73~108 槽（页 7~9）**，换个姿态 / 形态后再加载会写进当前生效的那一页。
 5. **性能**：保存/自检都是分帧任务（每帧 3~6 个槽位）；3.3.5 判类型不动光标，比 1.12 更轻。插件不注册任何动作条/退出事件，不挂钩 `PlaceAction`/`Logout`/`Quit`，平时完全不做事（计时帧每帧只做一次极轻量的判断）。
 6. **安全序列化（无 `loadstring`）**：便携字符串是 `ABP1:` + 标准 Base64 + netstring（`#长度:内容`）字段流。解析只做字符串切分与数字校验，从不把输入当代码执行；前缀不符、Base64 非法、长度不足、段数量不符、版本不符都会被明确拒绝。宏体里的中文、换行、`|`、`;`、`#`、`\`、引号都因长度前缀而无需转义。
 7. **宏重建的边界**：导出时把宏体、图标贴图、是否角色宏一起写入 `macroBodies`（老存档没有这段数据时，导出会现场读取本机同名宏）。加载/导入时按**宏名 → 宏体 → 新建**的顺序查找，已有同宏体的宏直接复用、不改名也不删除；只有宏位不足时才放弃并在"没能恢复"清单里写"没有空余的宏位"。不再像旧实现那样改名后重复建宏。
-8. **按键绑定的范围与冲突**：绑定记录的是动作条按钮命令（`ACTIONBUTTON1~12`、`MULTIACTIONBAR*BUTTON*`、`BONUSACTIONBUTTON*`、`SHAPESHIFTBUTTON*`），不是动作槽号，所以主条翻页时同一组键位仍然有效。使用 Bartender4 / Dominos / ElvUI 时，除主条前 12 个按钮外，其余按钮的键位是 `CLICK <按钮名>:<鼠标键>` 形式；插件能识别这些动作条按钮并用 `SetBindingClick` 恢复（只认 `BT4Button*`、`BT4PetButton*`、`BT4StanceButton*`、`DominosActionButton*`、`ElvUI_Bar*Button*`，框体/团队框架等其它 `CLICK` 一律不碰）。动作条之外的普通绑定单独存在 `otherBindings`（移动、聊天、界面、交互等），加载时先解绑这些命令的当前键位，再恢复动作条键位，最后恢复其它键位；两边抢同一个键时动作条优先，其它按键跳过并报告冲突。老配置没有对应字段时完全不碰当前按键。
+8. **按键绑定的范围与冲突**：绑定记录的是动作条按钮命令（`ACTIONBUTTON1~12`、`MULTIACTIONBAR*BUTTON*`、`BONUSACTIONBUTTON*`、`SHAPESHIFTBUTTON*`），不是动作槽号，所以主条翻页时同一组键位仍然有效。使用 Bartender4 / Dominos / ElvUI 时，除主条前 12 个按钮外，其余按钮的键位是 `CLICK <按钮名>:<鼠标键>` 形式；插件能识别这些动作条按钮并用 `SetBindingClick` 恢复（只认 `BT4Button*`、`BT4PetButton*`、`BT4StanceButton*`、`DominosActionButton*`、`ElvUI_Bar*Button*`，框体/团队框架等其它 `CLICK` 一律不碰）。动作条之外的普通绑定单独存在 `otherBindings`（移动、聊天、界面、交互等），加载时先解绑这些命令的当前键位，再恢复动作条键位，最后恢复其它键位；**动作条键位以存档为准**，即使被内置翻页命令（`ACTIONPAGE1`/`ACTIONPAGE3`）等占用也会强制改绑；同一存档内动作条与其它按键抢键时动作条优先，其它按键跳过并报告。老配置没有对应字段时完全不碰当前按键。
 9. **不包含动作条外观布局**：按钮位置、数量、分页、缩放属于动作条插件（Bartender4、Dominos 等）自己的数据，本插件不读取也不还原，只保存按钮上的动作和按键。
 
 ## 多版本支持（3.3.5 / 1.12）
