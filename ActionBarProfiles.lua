@@ -1949,17 +1949,23 @@ StaticPopupDialogs["ABP_NewProfile"] = {
         local box = ABP_GetPopupEditBox(self)
         if not box then return end
         local profileName = box:GetText()
-        ABP_RequestSave(profileName)
+        box:ClearFocus() -- 弹窗隐藏后输入框若仍持有焦点，会吞掉动作条按键（要按 ESC 才恢复）
         box:SetText("")
+        ABP_RequestSave(profileName)
     end,
     EditBoxOnEnterPressed = function(self)
         local box = self or this
         if not box then return end
         local profileName = box:GetText()
-        ABP_RequestSave(profileName)
+        box:ClearFocus()
         box:SetText("")
         local popup = box:GetParent()
         if popup then popup:Hide() end
+        ABP_RequestSave(profileName)
+    end,
+    OnHide = function(self)
+        local box = ABP_GetPopupEditBox(self)
+        if box and box.HasFocus and box:HasFocus() then box:ClearFocus() end
     end,
     timeout = 0,
     whileDead = true,

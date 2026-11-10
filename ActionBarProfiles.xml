@@ -216,5 +216,10 @@
 				</Scripts>
 			</Button>
 		</Frames>
+		<Scripts>
+			<OnHide>
+				ABP_PortableFrameEditBox:ClearFocus();
+			</OnHide>
+		</Scripts>
 	</Frame>
 </Ui>
