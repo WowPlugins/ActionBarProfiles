@@ -1543,12 +1543,26 @@ end
 -- 仍是"真正执行"的函数，确认弹窗里的回调才会调用它们。
 local ABP_PendingConfirm = nil
 
+-- 关闭小地图按钮的下拉菜单（含已展开的子菜单层级）
+-- 1.12 / 3.3.5 都有 CloseDropDownMenus，取不到时退回 CloseMenus
+local function ABP_CloseMenu()
+    if CloseDropDownMenus then
+        CloseDropDownMenus()
+    elseif CloseMenus then
+        CloseMenus()
+    end
+end
+
 local function ABP_ConfirmAction(popupName, arg, action)
+    -- 弹确认框前先收起菜单，否则确认后下拉菜单会一直挂在屏幕上
+    ABP_CloseMenu()
     ABP_PendingConfirm = action
     StaticPopup_Show(popupName, arg)
 end
 
 local function ABP_DoPendingConfirm()
+    -- 点确认后再收一次，确保菜单不会残留
+    ABP_CloseMenu()
     local action = ABP_PendingConfirm
     ABP_PendingConfirm = nil
     if action then action() end
@@ -1784,7 +1798,7 @@ function ABP_DropDownMenu_OnLoad(menu)
                 UIDropDownMenu_AddButton({
                     text = pname,
                     value = pname,
-                    func = function() ABP_RequestRemove(pname) end,
+                    func = function() ABP_CloseMenu(); ABP_RequestRemove(pname) end,
                     notCheckable = 1,
                     owner = owner,
                 }, UIDROPDOWNMENU_MENU_LEVEL)
@@ -1809,7 +1823,7 @@ function ABP_DropDownMenu_OnLoad(menu)
                 UIDropDownMenu_AddButton({
                     text = pname,
                     value = pname,
-                    func = function() ABP_RequestSave(pname) end,
+                    func = function() ABP_CloseMenu(); ABP_RequestSave(pname) end,
                     notCheckable = 1,
                     owner = owner,
                 }, UIDROPDOWNMENU_MENU_LEVEL)
@@ -1818,7 +1832,7 @@ function ABP_DropDownMenu_OnLoad(menu)
 
         UIDropDownMenu_AddButton({
             text = "新建...",
-            func = function() StaticPopup_Show("ABP_NewProfile") end,
+            func = function() ABP_CloseMenu(); StaticPopup_Show("ABP_NewProfile") end,
             notCheckable = 1,
             owner = owner,
         }, UIDROPDOWNMENU_MENU_LEVEL)
@@ -1841,7 +1855,7 @@ function ABP_DropDownMenu_OnLoad(menu)
                 UIDropDownMenu_AddButton({
                     text = pname,
                     value = pname,
-                    func = function() ABP_Portable_ShowExport(pname) end,
+                    func = function() ABP_CloseMenu(); ABP_Portable_ShowExport(pname) end,
                     notCheckable = 1,
                     owner = owner,
                 }, UIDROPDOWNMENU_MENU_LEVEL)
@@ -1864,7 +1878,7 @@ function ABP_DropDownMenu_OnLoad(menu)
             local pname = profileName
             UIDropDownMenu_AddButton({
                 text = pname,
-                func = function() ABP_RequestLoad(pname) end,
+                func = function() ABP_CloseMenu(); ABP_RequestLoad(pname) end,
                 notCheckable = 1,
                 owner = owner,
             }, UIDROPDOWNMENU_MENU_LEVEL)
@@ -1897,7 +1911,7 @@ function ABP_DropDownMenu_OnLoad(menu)
 
     UIDropDownMenu_AddButton({
         text = "从字符串导入...",
-        func = function() ABP_Portable_ShowImport() end,
+        func = function() ABP_CloseMenu(); ABP_Portable_ShowImport() end,
         notCheckable = 1,
         owner = owner,
     }, UIDROPDOWNMENU_MENU_LEVEL)
